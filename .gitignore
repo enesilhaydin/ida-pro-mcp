@@ -35,3 +35,7 @@ scalene-profile.json
 
 # MCP config
 .mcp.json
+
+# AI assistant files
+CLAUDE.md
+docs/superpowers/
