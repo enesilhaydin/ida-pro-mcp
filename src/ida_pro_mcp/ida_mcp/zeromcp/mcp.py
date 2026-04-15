@@ -193,24 +193,14 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         """Handle OAuth discovery endpoints (RFC 9728).
 
         MCP clients (e.g. Claude Code) probe these before connecting.
-        Return proper metadata indicating no authorization is required.
+        For oauth-protected-resource: return 200 with empty authorization_servers
+        to signal that no authorization is required.
+        For everything else: return 404 so clients don't attempt auth flows.
         """
         if path == "/.well-known/oauth-protected-resource":
-            # RFC 9728: Protected Resource Metadata
-            # Empty authorization_servers = no auth required
             host = self.headers.get("Host", "localhost")
             body = json.dumps({
                 "resource": f"http://{host}",
-                "authorization_servers": [],
-            }).encode("utf-8")
-            self.send_response(200)
-        elif path == "/.well-known/oauth-authorization-server":
-            # No authorization server configured
-            body = json.dumps({
-                "issuer": f"http://{self.headers.get('Host', 'localhost')}",
-                "authorization_endpoint": "",
-                "token_endpoint": "",
-                "response_types_supported": [],
             }).encode("utf-8")
             self.send_response(200)
         else:
