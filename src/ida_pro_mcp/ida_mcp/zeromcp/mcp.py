@@ -187,101 +187,10 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
         return True
 
-    # ------------------------------------------------------------------
-    # Minimal OAuth 2.1 (rubber-stamp) – satisfies MCP client discovery
-    # without real authentication.  Every token request is auto-approved.
-    # ------------------------------------------------------------------
-
-    def _oauth_json(self, status: int, obj: dict):
-        body = json.dumps(obj).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_cors_headers()
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _handle_oauth_resource_metadata(self):
-        host = self.headers.get("Host", "localhost")
-        self._oauth_json(200, {
-            "resource": f"http://{host}",
-            "authorization_servers": [f"http://{host}"],
-        })
-
-    def _handle_oauth_server_metadata(self):
-        host = self.headers.get("Host", "localhost")
-        base = f"http://{host}"
-        self._oauth_json(200, {
-            "issuer": base,
-            "authorization_endpoint": f"{base}/oauth/authorize",
-            "token_endpoint": f"{base}/oauth/token",
-            "registration_endpoint": f"{base}/oauth/register",
-            "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code", "refresh_token"],
-            "token_endpoint_auth_methods_supported": ["none"],
-            "code_challenge_methods_supported": ["S256"],
-        })
-
-    def _handle_oauth_register(self):
-        """Dynamic client registration — accept anything, echo back fields."""
-        raw = self._read_body()
-        req = json.loads(raw) if raw else {}
-        client_id = str(uuid.uuid4())
-        resp = {
-            "client_id": client_id,
-            "client_id_issued_at": int(time.time()),
-            "token_endpoint_auth_method": "none",
-            "grant_types": req.get("grant_types", ["authorization_code"]),
-            "response_types": req.get("response_types", ["code"]),
-            "redirect_uris": req.get("redirect_uris", []),
-            "client_name": req.get("client_name", ""),
-            "scope": req.get("scope", ""),
-        }
-        self._oauth_json(200, resp)
-
-    def _handle_oauth_authorize(self):
-        """Authorization endpoint — auto-approve and redirect with code."""
-        qs = parse_qs(urlparse(self.path).query)
-        redirect_uri = qs.get("redirect_uri", [""])[0]
-        state = qs.get("state", [""])[0]
-        code = str(uuid.uuid4())
-        # Store nothing — we accept any code at the token endpoint
-        location = f"{redirect_uri}?code={code}"
-        if state:
-            location += f"&state={state}"
-        self.send_response(302)
-        self.send_header("Location", location)
-        self.send_cors_headers()
-        self.end_headers()
-
-    def _handle_oauth_token(self):
-        """Token endpoint — return a dummy bearer token for any request."""
-        self._read_body()  # consume POST body
-        self._oauth_json(200, {
-            "access_token": str(uuid.uuid4()),
-            "token_type": "bearer",
-            "expires_in": 86400,
-            "refresh_token": str(uuid.uuid4()),
-        })
-
-    # ------------------------------------------------------------------
-
     def do_GET(self):
-        path = urlparse(self.path).path
-        # OAuth discovery & authorization (no API auth check)
-        if path == "/.well-known/oauth-protected-resource":
-            self._handle_oauth_resource_metadata()
-            return
-        if path == "/.well-known/oauth-authorization-server":
-            self._handle_oauth_server_metadata()
-            return
-        if path == "/oauth/authorize":
-            self._handle_oauth_authorize()
-            return
         if not self._check_api_request():
             return
-        match path:
+        match urlparse(self.path).path:
             case "/sse":
                 self._handle_sse_get()
             case "/mcp":
@@ -290,21 +199,13 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "Not Found")
 
     def do_POST(self):
-        path = urlparse(self.path).path
-        # OAuth endpoints (no API auth check)
-        if path == "/oauth/token":
-            self._handle_oauth_token()
-            return
-        if path == "/oauth/register":
-            self._handle_oauth_register()
-            return
         if not self._check_api_request():
             return
         body = self._read_body()
         if body is None:
             return
 
-        match path:
+        match urlparse(self.path).path:
             case "/sse":
                 self._handle_sse_post(body)
             case "/mcp":
