@@ -192,7 +192,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._check_api_request():
             return
-        match path:
+        match urlparse(self.path).path:
             case "/sse":
                 self._handle_sse_get()
             case "/mcp":
