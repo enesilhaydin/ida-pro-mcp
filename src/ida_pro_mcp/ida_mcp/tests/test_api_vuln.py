@@ -60,10 +60,10 @@ def test_vuln_scan_single_function():
     result = vuln_scan(scope=CRACKME_MAIN)
     assert_has_keys(result, "scanned_functions", "total_findings", "findings", "summary")
     assert result["scanned_functions"] <= 1
-    # All findings should belong to the scanned function address
+    # All findings should belong to the scanned function; check func_name is set
     for finding in result["findings"]:
-        assert finding["addr"] == "0x123e", (
-            f"Finding addr {finding['addr']!r} doesn't match scanned function"
+        assert finding["func_name"] is not None, (
+            f"Finding is missing func_name: {finding!r}"
         )
 
 

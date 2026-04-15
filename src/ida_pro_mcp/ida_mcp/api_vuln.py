@@ -32,6 +32,8 @@ from .api_ctree import (
     PatternConfig,
     CtreeMatchResult,
 )
+# NOTE: ctree_query is intentionally NOT imported here — it is @tool @idasync
+# decorated, so calling it from within another @idasync function would deadlock.
 
 
 # ============================================================================
@@ -314,7 +316,11 @@ def vuln_scan(
                     cfunc, selected_patterns, func.start_ea, func_name
                 )
 
-    # Filter by severity threshold
+    # Filter by severity threshold.
+    # _SEV_ORDER maps critical→0, high→1, medium→2, low→3 (lower = more severe).
+    # Keeping findings whose numeric rank is <= threshold means we keep everything
+    # at or above the requested minimum severity (e.g. severity_min="high" keeps
+    # critical and high, but drops medium and low).
     filtered = [
         f for f in raw_findings
         if _SEV_ORDER.get(f.get("severity", "low"), 3) <= sev_threshold
@@ -417,25 +423,32 @@ def vuln_deep(
     if cfunc is not None:
         ctree_hits = match_function(cfunc, selected, func.start_ea, func_name)
 
-    # Build ctree context: all call nodes in function
-    ctree_context: list[dict] = []
-    if cfunc is not None:
-        try:
-            from .api_ctree import ctree_query as _ctree_query  # re-use existing tool
-            ctree_context = _ctree_query(addr, node_types="call", count=50)
-        except Exception:
-            pass
+    # Build ctree context from match results directly.
+    # NOTE: ctree_query is @tool @idasync decorated — calling it from within
+    # another @idasync function would deadlock.  We use the match hits already
+    # collected above as the ctree context instead.
+    ctree_context: list[dict] = [
+        {
+            "addr": h.get("addr"),
+            "func_name": h.get("func_name"),
+            "pattern_name": h.get("pattern_name"),
+            "snippet": h.get("snippet"),
+        }
+        for h in ctree_hits
+    ]
 
-    # Data-flow: try mcode_source if available
-    data_source: list[dict] = []
-    if include_dataflow:
-        try:
-            from .api_microcode import mcode_source  # type: ignore[import]
-            ds = mcode_source(addr, count=20)
-            if isinstance(ds, list):
-                data_source = ds
-        except Exception:
-            pass
+    # Data-flow: mcode_source is @idasync decorated — calling it from within
+    # another @idasync function would deadlock, and its signature requires
+    # (func_addr, var) which we don't have here.  Provide a note instead.
+    data_source: dict = {
+        "origin_type": "not_available",
+        "note": (
+            "Use mcode_source(func_addr, var) directly for data-flow analysis. "
+            "Calling it from within vuln_deep would deadlock due to nested @idasync."
+        ),
+    }
+    if not include_dataflow:
+        data_source = {}
 
     # Callers
     callers: list[dict] = []
@@ -500,8 +513,8 @@ def vuln_deep(
         "exploitability": exploitability,
         "recommendation": recommendation,
     }
-    if data_source:
-        result["data_source"] = data_source
+    if include_dataflow and data_source:
+        result["data_source"] = data_source  # type: ignore[assignment]
     if callers:
         result["callers"] = callers
     return result
@@ -860,15 +873,20 @@ def check_mitigations() -> dict:
     except Exception:
         file_type = "unknown"
 
+    # Use idaapi.SEGPERM_* constants with getattr fallback for older IDA versions
+    SEGPERM_READ = getattr(idaapi, "SEGPERM_READ", 4)
+    SEGPERM_WRITE = getattr(idaapi, "SEGPERM_WRITE", 2)
+    SEGPERM_EXEC = getattr(idaapi, "SEGPERM_EXEC", 1)
+
     # --- NX: look for a segment that is writable AND executable ---
     rwx_segments: list[dict] = []
     nx = True
     seg = ida_segment.get_first_seg()
     while seg is not None:
         perm = seg.perm
-        R = (perm & 4) != 0
-        W = (perm & 2) != 0
-        X = (perm & 1) != 0
+        R = (perm & SEGPERM_READ) != 0
+        W = (perm & SEGPERM_WRITE) != 0
+        X = (perm & SEGPERM_EXEC) != 0
         if W and X:
             nx = False
             seg_name = ida_segment.get_segm_name(seg) or "?"
@@ -887,24 +905,49 @@ def check_mitigations() -> dict:
     except Exception:
         pie = False
 
-    # --- Stack canary: __stack_chk_fail import ---
+    # --- Stack canary and FORTIFY_SOURCE: scan imports ---
     stack_canary = False
     fortify = False
-    relro = False
     nimps = idaapi.get_import_module_qty()
     for i in range(nimps):
         def _scan_cb(ea: int, name: str | None, ord_: int) -> bool:
-            nonlocal stack_canary, fortify, relro
+            nonlocal stack_canary, fortify
             if name:
                 if "__stack_chk_fail" in name:
                     stack_canary = True
-                if name.endswith("_chk") or name.startswith("__"):
+                # Only match _chk-suffixed names (FORTIFY_SOURCE wrappers)
+                if name.endswith("_chk"):
                     fortify = True
-                # RELRO heuristic: _dl_runtime_resolve or __cxa_finalize presence
-                if "_dl_runtime_resolve" in name or "__cxa_finalize" in name:
-                    relro = True
             return True
         idaapi.enum_import_names(i, _scan_cb)
+
+    # --- RELRO: inspect .got.plt and .got sections ---
+    # full RELRO: .got.plt absent and .got is read-only; or .got.plt is read-only
+    # partial RELRO: .got.plt present and writable (lazy binding)
+    # none: neither section found, or .got is writable
+    got_plt_seg = None
+    got_seg = None
+    _s = ida_segment.get_first_seg()
+    while _s:
+        _seg_name = ida_segment.get_segm_name(_s) or ""
+        if _seg_name == ".got.plt":
+            got_plt_seg = _s
+        elif _seg_name == ".got":
+            got_seg = _s
+        _s = ida_segment.get_next_seg(_s.start_ea)
+
+    if got_plt_seg is not None:
+        if got_plt_seg.perm & SEGPERM_WRITE:
+            relro = "partial"
+        else:
+            relro = "full"
+    elif got_seg is not None:
+        if not (got_seg.perm & SEGPERM_WRITE):
+            relro = "full"
+        else:
+            relro = "none"
+    else:
+        relro = "none"
 
     # Risk notes
     risk_notes: list[str] = []
