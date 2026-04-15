@@ -152,11 +152,13 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Private-Network", "true")
 
     def send_error(self, code, message=None, explain=None):
+        body = json.dumps({"error": message or "Unknown error"}).encode("utf-8")
         self.send_response(code)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.send_cors_headers()
         self.end_headers()
-        self.wfile.write(f"{message}\n".encode("utf-8"))
+        self.wfile.write(body)
 
     def handle(self):
         """Override to add error handling for connection errors"""
