@@ -109,8 +109,9 @@ def test_segment_xrefs_pagination():
     total = r1["summary"]["total"]
     if total >= 10:
         # Pages should not overlap
-        addrs1 = {x["from_addr"] + x["to_addr"] for x in r1["xrefs"]}
-        addrs2 = {x["from_addr"] + x["to_addr"] for x in r2["xrefs"]}
-        assert len(addrs1 & addrs2) == 0 or True  # allow overlap for same ea->multiple targets
+        keys1 = [(x["from_addr"], x["to_addr"]) for x in r1["xrefs"]]
+        keys2 = [(x["from_addr"], x["to_addr"]) for x in r2["xrefs"]]
+        # Pages must be disjoint as ordered slices
+        assert keys1 != keys2
     assert len(r1["xrefs"]) <= 5
     assert len(r2["xrefs"]) <= 5

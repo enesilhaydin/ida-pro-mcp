@@ -907,10 +907,10 @@ def detect_libs(
     lumina_available = False
     lumina_matches = 0
     try:
-        import ida_lumina  # noqa: F401
+        import ida_lumina
         lumina_available = True
     except ImportError:
-        pass
+        ida_lumina = None  # type: ignore[assignment]
 
     # Collect all functions: total, lib-flagged
     lib_funcs: list[tuple[int, str]] = []  # (ea, name)
@@ -924,6 +924,17 @@ def detect_libs(
             lib_funcs.append((ea, name))
 
     total_library_functions = len(lib_funcs)
+
+    # Count Lumina-matched functions (IDA 9.x+; gracefully skipped when unavailable)
+    if lumina_available and ida_lumina is not None:
+        try:
+            has_metadata = getattr(ida_lumina, "has_metadata", None)
+            if callable(has_metadata):
+                for func_ea in idautils.Functions():
+                    if has_metadata(func_ea):
+                        lumina_matches += 1
+        except Exception:
+            pass
 
     # Group by library name
     lib_groups: dict[str, list[tuple[int, str]]] = {}

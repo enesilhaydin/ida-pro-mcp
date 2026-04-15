@@ -114,16 +114,17 @@ def segment_xrefs(
     count = min(count, 500)
     xref_type = xref_type.lower()
 
-    # Build segment lookup: ea -> name
-    seg_map: dict[tuple[int, int], str] = {}
+    # Build segment lookup: name -> (start, end) for iteration
+    seg_map: dict[str, tuple[int, int]] = {}
     for seg in _get_all_segments():
-        seg_map[(seg.start_ea, seg.end_ea)] = ida_segment.get_segm_name(seg) or ""
+        name = ida_segment.get_segm_name(seg) or ""
+        seg_map[name] = (seg.start_ea, seg.end_ea)
 
     def _ea_to_seg_name(ea: int) -> str | None:
-        for (start, end), name in seg_map.items():
-            if start <= ea < end:
-                return name
-        return None
+        seg = ida_segment.getseg(ea)
+        if seg is None:
+            return None
+        return ida_segment.get_segm_name(seg) or None
 
     from_seg_lower = from_segment.lower()
     to_seg_lower = to_segment.lower()
@@ -132,7 +133,7 @@ def segment_xrefs(
     max_sample = 10000
     sampled = 0
 
-    for (seg_start, seg_end), seg_name in seg_map.items():
+    for seg_name, (seg_start, seg_end) in seg_map.items():
         if from_seg_lower != "all" and seg_name.lower() != from_seg_lower:
             continue
 

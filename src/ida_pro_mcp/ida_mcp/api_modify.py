@@ -110,7 +110,6 @@ def nop_range(
     addr: Annotated[str, "Start address"],
     end: Annotated[str, "End address (exclusive)"] = "",
     count: Annotated[int, "Number of instructions to NOP (alternative to end)"] = 0,
-    nop_calls: Annotated[bool, "NOP entire call instruction if addr is CALL"] = False,
 ) -> NopRangeResult:
     """NOP out an address range or specific instructions."""
     if not addr:
