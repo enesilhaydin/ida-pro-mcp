@@ -91,17 +91,18 @@ def test_mcode_defuse_different_maturity():
 
 @test(binary="crackme03.elf")
 def test_mcode_defuse_invalid_addr():
-    """mcode_defuse raises an error for an invalid address."""
+    """mcode_defuse returns a list with an error entry for an invalid address."""
     result = mcode_defuse("0xdeadbeefdeadbeef")
-    # The result should be an error — framework wraps IDAError into a list with error key
-    assert_error(result)
+    assert_is_list(result, min_length=1)
+    assert "error" in result[0], f"Expected 'error' key in first element, got {result[0]}"
 
 
 @test(binary="crackme03.elf")
 def test_mcode_defuse_invalid_maturity():
-    """mcode_defuse raises an error for an unknown maturity string."""
+    """mcode_defuse returns a list with an error entry for an unknown maturity string."""
     result = mcode_defuse(CRACKME_MAIN, maturity="MMAT_INVALID")
-    assert_error(result)
+    assert_is_list(result, min_length=1)
+    assert "error" in result[0], f"Expected 'error' key in first element, got {result[0]}"
 
 
 # ============================================================================
@@ -163,9 +164,9 @@ def test_mcode_source_max_depth_clamped():
 
 @test(binary="crackme03.elf")
 def test_mcode_source_invalid_addr():
-    """mcode_source raises an error for an invalid address."""
+    """mcode_source returns an error dict for an invalid address."""
     result = mcode_source("0xdeadbeefdeadbeef", var="x")
-    assert_error(result)
+    assert "error" in result, f"Expected 'error' key in result, got {result}"
 
 
 # ============================================================================

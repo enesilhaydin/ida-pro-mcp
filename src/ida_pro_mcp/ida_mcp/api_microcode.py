@@ -15,6 +15,13 @@ from .sync import idasync, IDAError
 from .utils import parse_address
 
 
+# IDA 9.x renamed area_t → range_t; support both
+_range_t = getattr(idaapi, "range_t", None) or getattr(idaapi, "area_t", None)
+
+# mop_S (stack variable operand) value is 5 in the IDA SDK; use getattr for safety
+_MOP_S = getattr(ida_hexrays, "mop_S", 5)
+
+
 # ============================================================================
 # Maturity level map
 # ============================================================================
@@ -97,7 +104,7 @@ def _get_mba(ea: int, maturity: int) -> "ida_hexrays.mba_t":
     if pfn is None:
         raise IDAError(f"No function at address 0x{ea:x}")
     mbr = ida_hexrays.mba_ranges_t()
-    mbr.ranges.push_back(idaapi.area_t(pfn.start_ea, pfn.end_ea))
+    mbr.ranges.push_back(_range_t(pfn.start_ea, pfn.end_ea))
     hf = ida_hexrays.hexrays_failure_t()
     ml = ida_hexrays.mlist_t()
     mba = ida_hexrays.gen_microcode(
@@ -128,15 +135,21 @@ def _parse_block_filter(block_filter: str, block_count: int) -> set[int] | None:
     if not block_filter.strip():
         return None
     part = block_filter.strip()
-    if "-" in part:
-        lo_s, hi_s = part.split("-", 1)
-        lo, hi = int(lo_s.strip()), int(hi_s.strip())
-        return set(range(max(0, lo), min(block_count, hi + 1)))
-    else:
-        idx = int(part)
-        if 0 <= idx < block_count:
-            return {idx}
-        return set()
+    try:
+        if "-" in part:
+            lo_s, hi_s = part.split("-", 1)
+            lo, hi = int(lo_s.strip()), int(hi_s.strip())
+            return set(range(max(0, lo), min(block_count, hi + 1)))
+        else:
+            idx = int(part)
+            if 0 <= idx < block_count:
+                return {idx}
+            return set()
+    except ValueError:
+        raise IDAError(
+            f"Invalid block_filter {block_filter!r}: expected an integer ('3') "
+            "or inclusive range ('0-5')"
+        )
 
 
 # ============================================================================
@@ -241,8 +254,10 @@ def _classify_origin(mop: "ida_hexrays.mop_t") -> tuple[str, str]:
         except Exception:
             detail = mop.dstr()
         return "global", detail
-    if t in (ida_hexrays.mop_r, ida_hexrays.mop_S):
+    if t == ida_hexrays.mop_r:
         return "param", mop.dstr()
+    if t == _MOP_S:
+        return "local", mop.dstr()
     if t == ida_hexrays.mop_d:
         return "retval", mop.dstr()
     return "unknown", mop.dstr()
@@ -265,6 +280,13 @@ def mcode_source(
     Starting from the first definition of 'var', follows the source operand
     recursively up to max_depth steps, classifying the ultimate origin as one of:
     const, global, param, retval, or unknown.
+
+    Limitations:
+    - First-definition semantics: only the first assignment to each variable key
+      in textual block order is considered; later redefinitions are ignored.
+    - Single-path tracing: at each step only the left source operand is followed
+      (right operand used as fallback). Phi-nodes and multi-source merges are not
+      traversed; the reported chain reflects one data-flow path, not all paths.
 
     Returns the full trace chain and origin classification.
     """
