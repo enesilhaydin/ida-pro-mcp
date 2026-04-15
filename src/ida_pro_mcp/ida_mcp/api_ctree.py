@@ -122,7 +122,7 @@ def _load_builtin_patterns() -> None:
             "name": "stack_buffer_gets",
             "category": "memory",
             "severity": "critical",
-            "targets": ["gets", "_gets", "fgets"],
+            "targets": ["gets", "_gets"],
             "check": "custom_call_pattern",
             "arg_index": 0,
             "description": "gets() has no length limit and is inherently unsafe",
@@ -561,12 +561,26 @@ def ctree_query(
 # ============================================================================
 
 class _CallFinder(ida_hexrays.ctree_visitor_t):
-    """Collect all cot_call expressions targeting a given set of function names."""
+    """Collect all cot_call expressions targeting a given set of function names.
+
+    Also tracks which calls appear directly inside a cit_expr statement
+    (i.e. the return value is discarded) via the expr_stmt_calls set.
+    """
 
     def __init__(self, targets: set[str]):
         super().__init__(ida_hexrays.CV_FAST)
         self.targets = targets
         self.calls: list["ida_hexrays.cexpr_t"] = []
+        # Set of call expression ids whose return value is discarded
+        self.expr_stmt_calls: set[int] = set()
+
+    def visit_insn(self, insn: "ida_hexrays.cinsn_t") -> int:
+        # cit_expr: an expression used as a statement — return value ignored
+        if insn.op == ida_hexrays.cit_expr:
+            expr = insn.cexpr
+            if expr is not None and expr.op == ida_hexrays.cot_call:
+                self.expr_stmt_calls.add(id(expr))
+        return 0
 
     def visit_expr(self, expr: "ida_hexrays.cexpr_t") -> int:
         if expr.op == ida_hexrays.cot_call:
@@ -610,19 +624,19 @@ def _check_format_user_controlled(call: "ida_hexrays.cexpr_t", arg_index: int) -
     return True, f"format arg [{arg_index}] is not a string literal: {snippet}"
 
 
-def _check_return_unchecked(call: "ida_hexrays.cexpr_t", cfunc: "ida_hexrays.cfunc_t") -> tuple[bool, str]:
-    """Return True if the call result is unused (parent is expression statement)."""
-    try:
-        parent = cfunc.body.find_parent_of(call)
-        if parent is None:
-            return False, ""
-        # If the parent is a cit_expr statement, the return value is discarded
-        if parent.op == ida_hexrays.cit_expr:
-            return True, "return value is discarded (expression statement)"
-        # If parent is an asg and we are the RHS, value IS used
-        return False, ""
-    except Exception:
-        return False, ""
+def _check_return_unchecked(
+    call: "ida_hexrays.cexpr_t",
+    expr_stmt_call_ids: set[int],
+) -> tuple[bool, str]:
+    """Return True if the call result is unused (appears in an expression statement).
+
+    Uses the pre-collected set of call-expression ids that were observed as
+    direct children of cit_expr instructions, avoiding the non-public
+    cfunc.body.find_parent_of() API.
+    """
+    if id(call) in expr_stmt_call_ids:
+        return True, "return value is discarded (expression statement)"
+    return False, ""
 
 
 def _check_integer_overflow_risk(call: "ida_hexrays.cexpr_t", arg_index: int) -> tuple[bool, str]:
@@ -751,6 +765,7 @@ def _run_check(
     pattern: PatternConfig,
     call: "ida_hexrays.cexpr_t",
     cfunc: "ida_hexrays.cfunc_t",
+    expr_stmt_call_ids: set[int] | None = None,
 ) -> tuple[bool, str]:
     check = pattern["check"]
     arg_index = pattern["arg_index"]
@@ -759,7 +774,7 @@ def _run_check(
     elif check == "format_user_controlled":
         return _check_format_user_controlled(call, arg_index)
     elif check == "return_unchecked":
-        return _check_return_unchecked(call, cfunc)
+        return _check_return_unchecked(call, expr_stmt_call_ids or set())
     elif check == "integer_overflow_risk":
         return _check_integer_overflow_risk(call, arg_index)
     elif check == "use_after_free":
@@ -771,6 +786,10 @@ def _run_check(
     elif check == "custom_call_pattern":
         return _check_custom_call_pattern(call, arg_index)
     return False, ""
+
+
+# Public alias for use by api_vuln.py and other callers
+run_check = _run_check
 
 
 def _match_patterns_in_cfunc(
@@ -785,7 +804,7 @@ def _match_patterns_in_cfunc(
         finder = _CallFinder(targets)
         finder.apply_to(cfunc.body, None)
         for call in finder.calls:
-            matched, detail = _run_check(pattern, call, cfunc)
+            matched, detail = _run_check(pattern, call, cfunc, finder.expr_stmt_call_ids)
             if matched:
                 try:
                     snippet = call.dstr()[:120]
@@ -803,6 +822,10 @@ def _match_patterns_in_cfunc(
                     entry["match_detail"] = detail
                 results.append(entry)
     return results
+
+
+# Public alias for use by api_vuln.py
+match_function = _match_patterns_in_cfunc
 
 
 # ============================================================================
@@ -910,27 +933,72 @@ class _CallSiteFinder(ida_hexrays.ctree_visitor_t):
         return 0
 
 
-def _find_enclosing_condition(cfunc: "ida_hexrays.cfunc_t", call_ea: int) -> str | None:
-    """Walk the body looking for an if-statement that contains call_ea."""
-    class _CondFinder(ida_hexrays.ctree_visitor_t):
+def _collect_if_ea_ranges(cfunc: "ida_hexrays.cfunc_t") -> list[tuple[int, int, str]]:
+    """Collect (min_ea, max_ea, condition_text) for every cit_if block."""
+    class _EaCollector(ida_hexrays.ctree_visitor_t):
         def __init__(self):
             super().__init__(ida_hexrays.CV_FAST)
-            self.condition: str | None = None
+            self.eas: list[int] = []
+
+        def visit_expr(self, expr: "ida_hexrays.cexpr_t") -> int:
+            ea = getattr(expr, "ea", idaapi.BADADDR)
+            if ea != idaapi.BADADDR:
+                self.eas.append(ea)
+            return 0
+
+        def visit_insn(self, insn: "ida_hexrays.cinsn_t") -> int:
+            ea = getattr(insn, "ea", idaapi.BADADDR)
+            if ea != idaapi.BADADDR:
+                self.eas.append(ea)
+            return 0
+
+    class _IfCollector(ida_hexrays.ctree_visitor_t):
+        def __init__(self):
+            super().__init__(ida_hexrays.CV_FAST)
+            self.ranges: list[tuple[int, int, str]] = []
 
         def visit_insn(self, insn: "ida_hexrays.cinsn_t") -> int:
             if insn.op == ida_hexrays.cit_if:
-                # Check if call_ea is within this if block
-                # Simple heuristic: if the if-insn ea <= call_ea, it might contain it
-                if insn.ea <= call_ea:
-                    try:
-                        self.condition = insn.cif.expr.dstr()
-                    except Exception:
-                        pass
+                try:
+                    cond_text = insn.cif.expr.dstr()
+                except Exception:
+                    cond_text = ""
+                # Collect all ea values under this if-block to find range
+                col = _EaCollector()
+                col.apply_to_exprs(insn, None)
+                # Also collect from then/else branches via the instruction visitor
+                col2 = _EaCollector()
+                col2.apply_to(insn, None)
+                all_eas = [e for e in col2.eas if e != idaapi.BADADDR]
+                if all_eas:
+                    self.ranges.append((min(all_eas), max(all_eas), cond_text))
+                elif insn.ea != idaapi.BADADDR:
+                    self.ranges.append((insn.ea, insn.ea, cond_text))
             return 0
 
-    finder = _CondFinder()
-    finder.apply_to(cfunc.body, None)
-    return finder.condition
+    col = _IfCollector()
+    col.apply_to(cfunc.body, None)
+    return col.ranges
+
+
+def _find_enclosing_condition(cfunc: "ida_hexrays.cfunc_t", call_ea: int) -> str | None:
+    """Walk the body looking for an if-statement that contains call_ea.
+
+    Uses a two-pass approach: first collect all cit_if blocks with their ea
+    ranges, then find the innermost one (smallest range) containing call_ea.
+    """
+    if call_ea == idaapi.BADADDR:
+        return None
+
+    ranges = _collect_if_ea_ranges(cfunc)
+    best: tuple[int, str] | None = None  # (span, cond_text)
+    for lo, hi, cond_text in ranges:
+        if lo <= call_ea <= hi and cond_text:
+            span = hi - lo
+            if best is None or span < best[0]:
+                best = (span, cond_text)
+
+    return best[1] if best is not None else None
 
 
 @tool
@@ -1024,7 +1092,7 @@ def ctree_vars(
     results: list[CtreeVarInfo] = []
     lvars = cfunc.get_lvars()
     for lvar in lvars:
-        name = lvar.name or f"<unnamed_{lvar.location}>"
+        name = lvar.name or f"<unnamed_{lvar.idx}>"
         try:
             type_str = lvar.type().dstr()
         except Exception:
