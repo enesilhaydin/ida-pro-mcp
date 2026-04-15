@@ -486,3 +486,90 @@ def test_undefine_batch():
         if idaapi.get_func(start_ea) is None:
             define_code({"addr": hex(start_ea)})
             define_func({"addr": hex(start_ea), "end": hex(end_ea)})
+
+
+# ============================================================================
+# Tests for nop_range
+# ============================================================================
+
+
+@test()
+def test_nop_range_patches_bytes_with_end():
+    """nop_range patches a byte range with NOPs and returns original bytes."""
+    from ..api_modify import nop_range
+    from ..api_memory import get_bytes, patch
+
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    ea = int(fn_addr, 16)
+    size = 4
+    end_addr = hex(ea + size)
+
+    original_result = get_bytes(fn_addr, size)
+    original_hex = original_result["bytes"]
+
+    try:
+        result = nop_range(addr=fn_addr, end=end_addr)
+        assert result["addr"] == hex(ea)
+        assert result["end"] == end_addr
+        assert result["bytes_patched"] == size
+        assert isinstance(result["instructions_patched"], int)
+        assert result["original_bytes"] == original_hex
+        patched = get_bytes(fn_addr, size)
+        assert patched["bytes"] == "90" * size
+    finally:
+        patch([{"addr": fn_addr, "bytes": original_hex}])
+
+
+@test()
+def test_nop_range_count_parameter():
+    """nop_range count parameter NOPs the specified number of instructions."""
+    from ..api_modify import nop_range
+    from ..api_memory import get_bytes, patch
+
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    original_result = get_bytes(fn_addr, 16)
+    original_hex = original_result["bytes"]
+
+    try:
+        result = nop_range(addr=fn_addr, count=2)
+        assert result["instructions_patched"] == 2
+        assert result["bytes_patched"] > 0
+        assert len(result["original_bytes"]) == result["bytes_patched"] * 2
+    finally:
+        patch([{"addr": fn_addr, "bytes": original_hex}])
+
+
+@test()
+def test_nop_range_rejects_both_end_and_count():
+    """nop_range raises an error when both end and count are provided."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    from ..api_modify import nop_range
+    try:
+        nop_range(addr=fn_addr, end=hex(int(fn_addr, 16) + 4), count=2)
+        assert False, "should have raised ValueError"
+    except Exception:
+        pass
+
+
+@test()
+def test_nop_range_rejects_neither_end_nor_count():
+    """nop_range raises an error when neither end nor count is provided."""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    from ..api_modify import nop_range
+    try:
+        nop_range(addr=fn_addr)
+        assert False, "should have raised ValueError"
+    except Exception:
+        pass

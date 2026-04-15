@@ -857,3 +857,114 @@ def find_regex(
         "matches": matches,
         "cursor": {"next": offset + limit} if more else {"done": True},
     }
+
+
+# Library name prefix mapping for detect_libs
+_LIB_PREFIX_MAP = [
+    (("SSL_", "EVP_", "BIO_", "X509_", "RSA_", "EC_", "OPENSSL_", "CRYPTO_"), "openssl"),
+    (("z_", "inflate", "deflate", "zlib_", "gz_"), "zlib"),
+    (("png_",), "libpng"),
+    (("sqlite3_",), "sqlite3"),
+    (("curl_",), "libcurl"),
+    (("pcre_", "pcre2_"), "pcre"),
+    (("lua_", "luaL_"), "lua"),
+    (("json_",), "jansson"),
+    (("mbedtls_",), "mbedtls"),
+    (("apr_",), "apr"),
+    (("boost_",), "boost"),
+    (("xml_", "xmlParse"), "libxml2"),
+    (("ZSTD_",), "zstd"),
+    (("LZ4_",), "lz4"),
+    (("bz2_", "BZ2_"), "bzip2"),
+    (("lzma_",), "liblzma"),
+    (("re2_", "RE2_"), "re2"),
+    (("snappy_", "Snappy"),  "snappy"),
+    (("sodium_", "crypto_"), "libsodium"),
+]
+
+
+def _detect_lib_name(func_name: str) -> str | None:
+    """Guess library name from function name prefix."""
+    for prefixes, lib_name in _LIB_PREFIX_MAP:
+        for prefix in prefixes:
+            if func_name.startswith(prefix):
+                return lib_name
+    return None
+
+
+@tool
+@idasync
+def detect_libs(
+    confidence_min: Annotated[float, "Minimum confidence (0.0-1.0)"] = 0.0,
+    offset: Annotated[int, "Pagination offset"] = 0,
+    count: Annotated[int, "Max results (max 200)"] = 100,
+) -> dict:
+    """Report FLIRT signature matches and library detection."""
+    import idc as _idc
+
+    FUNC_LIB = getattr(_idc, "FUNC_LIB", 0x4)
+
+    lumina_available = False
+    lumina_matches = 0
+    try:
+        import ida_lumina  # noqa: F401
+        lumina_available = True
+    except ImportError:
+        pass
+
+    # Collect all functions: total, lib-flagged
+    lib_funcs: list[tuple[int, str]] = []  # (ea, name)
+    total_functions = 0
+
+    for ea in idautils.Functions():
+        total_functions += 1
+        flags = _idc.get_func_flags(ea)
+        if flags != -1 and (flags & FUNC_LIB):
+            name = idaapi.get_name(ea) or hex(ea)
+            lib_funcs.append((ea, name))
+
+    total_library_functions = len(lib_funcs)
+
+    # Group by library name
+    lib_groups: dict[str, list[tuple[int, str]]] = {}
+    unmatched: list[tuple[int, str]] = []
+
+    for ea, name in lib_funcs:
+        lib_name = _detect_lib_name(name)
+        if lib_name is None:
+            # Try stripping leading underscore
+            stripped = name.lstrip("_")
+            lib_name = _detect_lib_name(stripped)
+        if lib_name is None:
+            unmatched.append((ea, name))
+        else:
+            lib_groups.setdefault(lib_name, []).append((ea, name))
+
+    # Build library result list
+    all_libs = []
+    for lib_name, funcs in sorted(lib_groups.items()):
+        matched = len(funcs)
+        confidence = min(1.0, matched / max(total_library_functions, 1))
+        if confidence < confidence_min:
+            continue
+        sample = [{"addr": hex(ea), "name": nm} for ea, nm in funcs[:5]]
+        all_libs.append({
+            "name": lib_name,
+            "matched_functions": matched,
+            "confidence": round(confidence, 4),
+            "sample_functions": sample,
+        })
+
+    # Sort by matched_functions desc
+    all_libs.sort(key=lambda x: x["matched_functions"], reverse=True)
+
+    page = all_libs[offset: offset + min(count, 200)]
+
+    return {
+        "libraries": page,
+        "total_library_functions": total_library_functions,
+        "unmatched_count": len(unmatched),
+        "total_functions": total_functions,
+        "lumina_available": lumina_available,
+        "lumina_matches": lumina_matches,
+    }

@@ -40,6 +40,7 @@ from . import api_discovery
 from . import api_ctree
 from . import api_microcode
 from . import api_vuln
+from . import api_segments
 
 # Re-export key components for external use
 from .sync import idasync, IDAError, IDASyncError, CancelledError
@@ -69,6 +70,7 @@ __all__ = [
     "api_ctree",
     "api_microcode",
     "api_vuln",
+    "api_segments",
     # Re-exported components
     "idasync",
     "IDAError",

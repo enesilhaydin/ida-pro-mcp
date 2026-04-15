@@ -466,3 +466,70 @@ def test_find_regex():
     """find_regex can search for patterns"""
     result = find_regex(".*")
     assert_has_keys(result, "matches", "cursor")
+
+
+# ============================================================================
+# Tests for detect_libs
+# ============================================================================
+
+
+@test()
+def test_detect_libs_returns_structure():
+    """detect_libs returns the expected top-level structure."""
+    from ..api_core import detect_libs
+
+    result = detect_libs()
+    assert isinstance(result, dict)
+    required = {
+        "libraries",
+        "total_library_functions",
+        "unmatched_count",
+        "total_functions",
+        "lumina_available",
+        "lumina_matches",
+    }
+    for key in required:
+        assert key in result, f"missing key: {key}"
+    assert isinstance(result["libraries"], list)
+    assert isinstance(result["total_library_functions"], int)
+    assert isinstance(result["unmatched_count"], int)
+    assert isinstance(result["total_functions"], int)
+    assert isinstance(result["lumina_available"], bool)
+    assert isinstance(result["lumina_matches"], int)
+    assert result["total_functions"] >= 0
+    assert result["total_library_functions"] >= 0
+
+
+@test()
+def test_detect_libs_library_entry_keys():
+    """detect_libs library entries have all required keys."""
+    from ..api_core import detect_libs
+
+    result = detect_libs()
+    for lib in result["libraries"]:
+        assert "name" in lib
+        assert "matched_functions" in lib
+        assert "confidence" in lib
+        assert "sample_functions" in lib
+        assert isinstance(lib["matched_functions"], int)
+        assert 0.0 <= lib["confidence"] <= 1.0
+        assert isinstance(lib["sample_functions"], list)
+
+
+@test()
+def test_detect_libs_confidence_filter():
+    """detect_libs confidence_min filters out low-confidence entries."""
+    from ..api_core import detect_libs
+
+    result = detect_libs(confidence_min=0.5)
+    for lib in result["libraries"]:
+        assert lib["confidence"] >= 0.5
+
+
+@test()
+def test_detect_libs_pagination():
+    """detect_libs count limits the returned libraries list."""
+    from ..api_core import detect_libs
+
+    result = detect_libs(count=2)
+    assert len(result["libraries"]) <= 2

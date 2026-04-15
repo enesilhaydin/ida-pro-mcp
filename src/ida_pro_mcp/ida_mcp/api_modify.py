@@ -11,7 +11,7 @@ import ida_dirtree
 import ida_funcs
 import ida_ua
 
-from .rpc import tool
+from .rpc import tool, unsafe
 from .sync import idasync, IDAError
 from .utils import (
     parse_address,
@@ -93,6 +93,81 @@ class DefineResult(TypedDict, total=False):
 # ============================================================================
 # Modification Operations
 # ============================================================================
+
+
+class NopRangeResult(TypedDict):
+    addr: str
+    end: str
+    bytes_patched: int
+    instructions_patched: int
+    original_bytes: str
+
+
+@unsafe
+@tool
+@idasync
+def nop_range(
+    addr: Annotated[str, "Start address"],
+    end: Annotated[str, "End address (exclusive)"] = "",
+    count: Annotated[int, "Number of instructions to NOP (alternative to end)"] = 0,
+    nop_calls: Annotated[bool, "NOP entire call instruction if addr is CALL"] = False,
+) -> NopRangeResult:
+    """NOP out an address range or specific instructions."""
+    if not addr:
+        raise ValueError("addr is required")
+    if bool(end) == bool(count > 0):
+        raise ValueError("Specify exactly one of: end address or count > 0")
+
+    start_ea = parse_address(addr)
+
+    if end:
+        end_ea = parse_address(end)
+        if end_ea <= start_ea:
+            raise ValueError("end must be greater than addr")
+        byte_count = end_ea - start_ea
+        # Count instructions in range
+        insn_count = 0
+        ea = start_ea
+        insn = ida_ua.insn_t()
+        while ea < end_ea:
+            length = ida_ua.decode_insn(insn, ea)
+            if length <= 0:
+                ea += 1
+            else:
+                insn_count += 1
+                ea += length
+        actual_end = end_ea
+    else:
+        # NOP `count` instructions
+        ea = start_ea
+        insn = ida_ua.insn_t()
+        insn_count = 0
+        while insn_count < count:
+            length = ida_ua.decode_insn(insn, ea)
+            if length <= 0:
+                ea += 1
+            else:
+                insn_count += 1
+                ea += length
+        actual_end = ea
+        byte_count = actual_end - start_ea
+
+    # Save original bytes
+    original = ida_bytes.get_bytes(start_ea, byte_count)
+    if original is None:
+        original = b""
+
+    # Patch with NOPs (0x90)
+    nop_bytes = bytes([0x90]) * byte_count
+    ida_bytes.patch_bytes(start_ea, nop_bytes)
+
+    return {
+        "addr": hex(start_ea),
+        "end": hex(actual_end),
+        "bytes_patched": byte_count,
+        "instructions_patched": insn_count,
+        "original_bytes": original.hex(),
+    }
 
 
 @tool
