@@ -38,6 +38,7 @@ from . import api_survey
 from . import api_composite
 from . import api_discovery
 from . import api_ctree
+from . import api_microcode
 
 # Re-export key components for external use
 from .sync import idasync, IDAError, IDASyncError, CancelledError
@@ -65,6 +66,7 @@ __all__ = [
     "api_composite",
     "api_discovery",
     "api_ctree",
+    "api_microcode",
     # Re-exported components
     "idasync",
     "IDAError",
