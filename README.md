@@ -43,7 +43,7 @@ Install the latest version of the IDA Pro MCP package:
 
 ```sh
 pip uninstall ida-pro-mcp
-pip install https://github.com/mrexodia/ida-pro-mcp/archive/refs/heads/main.zip
+pip install https://github.com/enesilhaydin/ida-pro-mcp/archive/refs/heads/main.zip
 ```
 
 Configure the MCP servers and install the IDA Plugin:
@@ -130,18 +130,121 @@ Another thing to keep in mind is that LLMs will not perform well on obfuscated c
 
 You should also use a tool like Lumina or FLIRT to try and resolve all the open source library code and the C++ STL, this will further improve the accuracy.
 
+## Network & Remote Setup
+
+By default, the IDA plugin and idalib server listen on `0.0.0.0` (all interfaces), allowing connections from other machines on your network.
+
+### Local setup (same machine)
+
+No extra configuration needed. IDA plugin starts on `0.0.0.0:13337`, MCP clients connect to `127.0.0.1:13337`.
+
+### Remote IDA setup (IDA on another machine)
+
+If IDA Pro is running on a different machine (e.g. `192.168.1.245`):
+
+**On the IDA machine (192.168.1.245):**
+1. Install the plugin: `pip install https://github.com/enesilhaydin/ida-pro-mcp/archive/refs/heads/main.zip && ida-pro-mcp --install`
+2. Open IDA, load a binary — the plugin auto-starts on `0.0.0.0:13337`
+3. You can change host/port via **Edit → Plugins → MCP Configuration**
+
+**On your workstation:**
+
+Run the proxy server pointing to the remote IDA:
+
+```sh
+# Proxy listens locally, forwards to remote IDA
+ida-pro-mcp --transport http://0.0.0.0:8744/mcp --ida-rpc http://192.168.1.245:13337
+
+# Or via SSH tunnel for security
+ssh -L 13337:127.0.0.1:13337 user@192.168.1.245
+ida-pro-mcp --transport http://127.0.0.1:8744/mcp
+```
+
+### MCP Client Configuration
+
+After `ida-pro-mcp --install`, the config is auto-generated. For manual setup or remote configurations:
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-mcp": {
+      "type": "http",
+      "url": "http://127.0.0.1:13337/mcp"
+    }
+  }
+}
+```
+
+**Claude Code** (`.claude.json` or via `claude mcp add`):
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-mcp": {
+      "type": "http",
+      "url": "http://127.0.0.1:13337/mcp"
+    }
+  }
+}
+```
+
+**Cursor** (`~/.cursor/mcp.json` for global, `.cursor/mcp.json` for project):
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-mcp": {
+      "type": "http",
+      "url": "http://127.0.0.1:13337/mcp"
+    }
+  }
+}
+```
+
+**VS Code** (`.vscode/mcp.json`):
+
+```json
+{
+  "servers": {
+    "ida-pro-mcp": {
+      "type": "http",
+      "url": "http://127.0.0.1:13337/mcp"
+    }
+  }
+}
+```
+
+**Remote IDA (when using proxy):**
+
+Replace `127.0.0.1:13337` with `127.0.0.1:8744` (the proxy port) or the remote IP directly:
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-mcp": {
+      "type": "http",
+      "url": "http://192.168.1.245:13337/mcp"
+    }
+  }
+}
+```
+
+For other clients, run `ida-pro-mcp --config` to generate the config JSON.
+
 ## SSE Transport & Headless MCP
 
 You can run an SSE server to connect to the user interface like this:
 
 ```sh
-uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
+uv run ida-pro-mcp --transport http://0.0.0.0:8744/sse
 ```
 
 After installing [`idalib`](https://docs.hex-rays.com/user-guide/idalib) you can also run a headless SSE server:
 
 ```sh
-uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/executable
+uv run idalib-mcp --host 0.0.0.0 --port 8745 path/to/executable
 ```
 
 _Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://github.com/williballenthin).
@@ -244,6 +347,36 @@ With `--isolated-contexts`, strict Streamable HTTP session semantics are enabled
 
 - `read_struct(queries)`: Read structure field values at specific address(es).
 - `search_structs(filter)`: Search structures by name pattern.
+
+## Vulnerability Analysis & Bug Bounty
+
+Tools for automated vulnerability discovery, crackme solving, and security research.
+
+**Vulnerability Scanning:**
+- `vuln_scan(scope, categories, severity_min)`: Binary-wide vulnerability scan with 24 builtin patterns (memory corruption, format string, integer overflow, UAF, command injection).
+- `vuln_deep(addr, pattern)`: Deep analysis of a finding with ctree context and exploitability assessment.
+- `vuln_patterns()`: List all registered vulnerability patterns.
+- `vuln_pattern_add(name, category, targets, check)`: Register custom patterns at runtime.
+- `crypto_scan(algorithms)`: Detect cryptographic constants (AES, SHA, MD5, TEA, CRC32, ChaCha, Blowfish).
+- `attack_surface(sink_categories)`: Map input entry points to dangerous sinks with reachability analysis.
+- `check_mitigations()`: Report binary security posture (NX, PIE, RELRO, stack canary, RWX segments).
+
+**Decompiler AST (Ctree) Analysis:**
+- `ctree_query(addr, node_types)`: Query decompiler AST nodes (calls, comparisons, assignments, loops).
+- `ctree_match(addr, pattern, categories)`: Match vulnerability patterns against decompiled code.
+- `ctree_callers_of(target)`: Find all call sites with argument expressions and enclosing conditions.
+- `ctree_vars(addr)`: Extract variable information from decompiled functions.
+
+**Microcode Analysis:**
+- `mcode_defuse(func_addr, var)`: Extract def-use chains from microcode IR.
+- `mcode_source(func_addr, var)`: Trace a value backward to its origin (parameter, global, constant, return value).
+- `mcode_inspect(func_addr, maturity)`: Dump microcode IR at configurable optimization levels.
+
+**Segment & Binary Analysis:**
+- `list_segments(filter)`: List segments with permissions (RWX), sizes, and types.
+- `segment_xrefs(from_segment, to_segment)`: Cross-segment reference analysis.
+- `detect_libs(confidence_min)`: FLIRT/signature library detection with version grouping.
+- `nop_range(addr, count)`: NOP out instructions for crackme patching (unsafe).
 
 ## Debugger Operations (Extension)
 
