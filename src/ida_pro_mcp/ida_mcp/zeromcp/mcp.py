@@ -696,7 +696,7 @@ class McpServer:
         return {
             "protocolVersion": getattr(self._protocol_version, "data", protocolVersion),
             "capabilities": {
-                "tools": {},
+                "tools": {"listChanged": False},
                 "resources": {
                     "subscribe": False,
                     "listChanged": False,
