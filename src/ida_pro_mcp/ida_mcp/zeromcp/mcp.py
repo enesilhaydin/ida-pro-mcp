@@ -189,14 +189,33 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
         return True
 
-    def _handle_oauth_metadata(self):
-        """Return JSON 404 for OAuth discovery endpoints.
+    def _handle_oauth_metadata(self, path: str):
+        """Handle OAuth discovery endpoints (RFC 9728).
 
         MCP clients (e.g. Claude Code) probe these before connecting.
-        A JSON response prevents parse errors on the client side.
+        Return proper metadata indicating no authorization is required.
         """
-        body = json.dumps({"error": "not_found", "error_description": "OAuth is not supported by this server"}).encode("utf-8")
-        self.send_response(404)
+        if path == "/.well-known/oauth-protected-resource":
+            # RFC 9728: Protected Resource Metadata
+            # Empty authorization_servers = no auth required
+            host = self.headers.get("Host", "localhost")
+            body = json.dumps({
+                "resource": f"http://{host}",
+                "authorization_servers": [],
+            }).encode("utf-8")
+            self.send_response(200)
+        elif path == "/.well-known/oauth-authorization-server":
+            # No authorization server configured
+            body = json.dumps({
+                "issuer": f"http://{self.headers.get('Host', 'localhost')}",
+                "authorization_endpoint": "",
+                "token_endpoint": "",
+                "response_types_supported": [],
+            }).encode("utf-8")
+            self.send_response(200)
+        else:
+            body = json.dumps({"error": "not_found"}).encode("utf-8")
+            self.send_response(404)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_cors_headers()
@@ -207,7 +226,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         # OAuth discovery endpoints — respond before auth check
         if path.startswith("/.well-known/"):
-            self._handle_oauth_metadata()
+            self._handle_oauth_metadata(path)
             return
         if not self._check_api_request():
             return
