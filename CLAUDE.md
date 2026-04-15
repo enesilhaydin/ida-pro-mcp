@@ -21,6 +21,10 @@ Important API modules:
 - `api_debug.py`: debugger control, unsafe / low priority for tests
 - `api_python.py`: execute Python in IDA context
 - `api_resources.py`: `ida://` MCP resources
+- `api_ctree.py`: decompiler AST traversal, vulnerability pattern matching
+- `api_microcode.py`: microcode def-use chains, value source tracing
+- `api_vuln.py`: vulnerability scanning, pattern registry, crypto detection, attack surface
+- `api_segments.py`: segment management, security mitigation checks
 
 ## Core implementation rules
 
@@ -140,6 +144,10 @@ High priority:
 - `api_memory.py`
 - `api_core.py`
 - `api_resources.py`
+- `api_ctree.py`
+- `api_microcode.py`
+- `api_vuln.py`
+- `api_segments.py`
 - `utils.py`
 - `framework.py`
 
@@ -151,6 +159,6 @@ Lower priority:
 ## Practical notes
 
 - Server/plugin Python: 3.11+
-- IDA Pro 8.3+; 9.0 recommended
+- IDA Pro 8.3+; 9.0 recommended; 9.3 for full feature set (Lumina, microcode manipulation)
 - IDA Free is not supported
 - If IDA uses the wrong Python, use `idapyswitch`
