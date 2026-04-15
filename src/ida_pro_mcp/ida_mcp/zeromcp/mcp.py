@@ -511,6 +511,11 @@ class McpServer:
             self._http_server = None
             raise
 
+        # When bound to a non-loopback address, automatically relax CORS
+        # so remote MCP clients can connect without origin errors.
+        if not _is_loopback_host(host) and self.cors_allowed_origins is self.cors_localhost:
+            self.cors_allowed_origins = "*"
+
         # Only start thread after successful bind
         self._running = True
 

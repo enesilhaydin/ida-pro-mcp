@@ -1,4 +1,5 @@
 import html
+import ipaddress
 import json
 import re
 import ida_netnode
@@ -77,6 +78,19 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
     return original_tools
 
 
+def _is_loopback_only(host: str) -> bool:
+    """Return True only when *host* is strictly a loopback address (127.x / ::1).
+
+    Returns False for unspecified addresses (0.0.0.0 / ::) because those
+    listen on all interfaces and are therefore network-exposed.
+    """
+    try:
+        addr = ipaddress.ip_address(host)
+        return addr.is_loopback
+    except ValueError:
+        return host.lower() == "localhost"
+
+
 DEFAULT_CORS_POLICY = "local"
 
 
@@ -102,11 +116,16 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         self.update_cors_policy()
 
     def update_cors_policy(self):
+        bound_host = self.server.server_address[0]
+        network_exposed = not _is_loopback_only(bound_host)
         match config_json_get("cors_policy", DEFAULT_CORS_POLICY):
             case "unrestricted":
                 self.mcp_server.cors_allowed_origins = "*"
             case "local":
-                self.mcp_server.cors_allowed_origins = self.mcp_server.cors_localhost
+                if network_exposed:
+                    self.mcp_server.cors_allowed_origins = "*"
+                else:
+                    self.mcp_server.cors_allowed_origins = self.mcp_server.cors_localhost
             case "direct":
                 self.mcp_server.cors_allowed_origins = None
 
@@ -206,9 +225,15 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         """
         Prevents CSRF and DNS rebinding attacks by ensuring POST requests
         originate from pages served by this server, not external websites.
+        When the server is bound to a non-loopback address (e.g. 0.0.0.0),
+        accepts any origin since the server is intentionally network-exposed.
         """
         origin = self.headers.get("Origin")
         port = self.server_port
+        bound_host = self.server.server_address[0]
+        if not _is_loopback_only(bound_host):
+            # Non-loopback bind: accept any origin (intentionally exposed)
+            return True
         if origin not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
             self.send_error(403, "Invalid Origin")
             return False
@@ -218,9 +243,14 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         """
         Prevents DNS rebinding attacks where an attacker's domain (e.g., evil.com)
         resolves to 127.0.0.1, allowing their page to read localhost resources.
+        When the server is bound to a non-loopback address (e.g. 0.0.0.0),
+        accepts any Host header since the server is intentionally network-exposed.
         """
         host = self.headers.get("Host")
         port = self.server_port
+        bound_host = self.server.server_address[0]
+        if not _is_loopback_only(bound_host):
+            return True
         if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
             self.send_error(403, "Invalid Host")
             return False

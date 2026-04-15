@@ -476,8 +476,8 @@ def main():
     parser.add_argument(
         "--host",
         type=str,
-        default="127.0.0.1",
-        help="Host to listen on, default: 127.0.0.1",
+        default="0.0.0.0",
+        help="Host to listen on, default: 0.0.0.0",
     )
     parser.add_argument(
         "--port", type=int, default=8745, help="Port to listen on, default: 8745"
