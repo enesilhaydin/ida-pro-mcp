@@ -224,14 +224,21 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_oauth_register(self):
-        """Dynamic client registration — accept anything, return client_id."""
-        body = self._read_body()
+        """Dynamic client registration — accept anything, echo back fields."""
+        raw = self._read_body()
+        req = json.loads(raw) if raw else {}
         client_id = str(uuid.uuid4())
-        self._oauth_json(200, {
+        resp = {
             "client_id": client_id,
-            "client_id_issued_at": int(__import__("time").time()),
+            "client_id_issued_at": int(time.time()),
             "token_endpoint_auth_method": "none",
-        })
+            "grant_types": req.get("grant_types", ["authorization_code"]),
+            "response_types": req.get("response_types", ["code"]),
+            "redirect_uris": req.get("redirect_uris", []),
+            "client_name": req.get("client_name", ""),
+            "scope": req.get("scope", ""),
+        }
+        self._oauth_json(200, resp)
 
     def _handle_oauth_authorize(self):
         """Authorization endpoint — auto-approve and redirect with code."""
