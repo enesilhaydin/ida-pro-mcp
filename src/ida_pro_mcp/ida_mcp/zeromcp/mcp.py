@@ -554,6 +554,7 @@ class McpServer:
         self._enabled_extensions = threading.local()  # set[str] per request
         self._extensions_registry = extensions if extensions is not None else {}  # group -> set of tool names
         self.require_streamable_http_session = False
+        self.include_output_schema = False  # Claude Code rejects tools with outputSchema
 
         # Register MCP protocol methods with correct names
         self.registry = JsonRpcRegistry()
@@ -1101,10 +1102,10 @@ class McpServer:
             }
         }
 
-        # Add outputSchema if return type exists and is not None
-        # NOTE: outputSchema temporarily disabled for Claude Code compatibility testing.
-        # Claude Code may silently reject tools that include this field.
-        if False and return_type and return_type is not type(None):
+        # Add outputSchema if return type exists and is not None.
+        # Disabled by default: Claude Code silently rejects all tools when
+        # outputSchema is present in any tool schema.
+        if self.include_output_schema and return_type and return_type is not type(None):
             return_schema = self._type_to_json_schema(return_type)
 
             # Wrap non-object returns in a "result" property.

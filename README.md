@@ -498,3 +498,33 @@ Generate the changelog of direct commits to `main`:
 ```sh
 git log --first-parent --no-merges 1.2.0..main "--pretty=- %s"
 ```
+
+## Troubleshooting
+
+### Tools not showing in Claude Code (`/mcp` shows connected but 0 tools)
+
+**Cause:** Claude Code silently rejects all tools when any tool schema includes the `outputSchema` field. This is a client-side limitation — the server returns tools correctly but the client ignores them.
+
+**Fix:** `outputSchema` is disabled by default in this fork. If you're building on top of zeromcp and need it, set `server.include_output_schema = True` — but note this will break Claude Code compatibility.
+
+### Claude Code shows "Auth: not authenticated" for remote IDA
+
+Remote (non-loopback) IDA instances may trigger Claude Code's OAuth flow. The server includes a rubber-stamp OAuth 2.1 implementation that auto-approves all requests. If authentication still fails:
+
+1. Run `/mcp` → Authenticate in Claude Code
+2. If that doesn't work, try `claude mcp reset-project-choices` in the project directory
+3. Check that the `.mcp.json` URL matches the IDA machine's IP and port
+
+### SSE vs HTTP transport
+
+Both transports are supported. Use HTTP (Streamable HTTP) when possible:
+
+```json
+{"mcpServers": {"ida": {"type": "http", "url": "http://<IP>:13337/mcp"}}}
+```
+
+SSE is still supported but deprecated:
+
+```json
+{"mcpServers": {"ida": {"type": "sse", "url": "http://<IP>:13337/sse"}}}
+```
