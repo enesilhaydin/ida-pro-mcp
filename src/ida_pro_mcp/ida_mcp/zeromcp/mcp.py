@@ -9,6 +9,7 @@ import gzip
 import zlib
 import ipaddress
 import inspect
+import logging
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
@@ -18,6 +19,8 @@ from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
 from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, get_current_request_id, register_pending_request, unregister_pending_request, cancel_request
+
+_log = logging.getLogger("mcp.server")
 
 class McpToolError(Exception):
     def __init__(self, message: str):
@@ -152,6 +155,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Private-Network", "true")
 
     def send_error(self, code, message=None, explain=None):
+        _log.warning("ERROR %d  %s  path=%s", code, message, self.path)
         self.send_response(code)
         self.send_header("Content-Type", "text/plain")
         self.send_cors_headers()
@@ -174,7 +178,9 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         and Origin headers closes that gap while keeping direct clients working.
         """
         bound_host = self.server.server_address[0]
-        if not _host_header_allowed_for_bind(bound_host, self.headers.get("Host")):
+        host_hdr = self.headers.get("Host")
+        if not _host_header_allowed_for_bind(bound_host, host_hdr):
+            _log.warning("REJECTED Host=%s  bound=%s", host_hdr, bound_host)
             self.send_error(403, "Invalid Host")
             return False
 
@@ -182,9 +188,11 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         if origin and not _origin_allowed_by_policy(
             self.mcp_server.cors_allowed_origins, origin
         ):
+            _log.warning("REJECTED Origin=%s  allowed=%s", origin, self.mcp_server.cors_allowed_origins)
             self.send_error(403, "Invalid Origin")
             return False
 
+        _log.debug("API check OK  Host=%s  Origin=%s", host_hdr, origin or "-")
         return True
 
     # ------------------------------------------------------------------
@@ -204,9 +212,15 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        auth_hdr = self.headers.get("Authorization", "")
+        _log.info("GET %s  Host=%s  Origin=%s  Auth=%s",
+                  self.path, self.headers.get("Host", "-"),
+                  self.headers.get("Origin", "-"),
+                  auth_hdr[:30] + "..." if len(auth_hdr) > 30 else auth_hdr or "-")
 
         # OAuth discovery & authorize — served before API auth check
         if path == "/.well-known/oauth-protected-resource":
+            _log.info("OAUTH protected-resource discovery")
             host = self.headers.get("Host", "localhost")
             self._oauth_respond(200, {
                 "resource": f"http://{host}",
@@ -215,6 +229,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/.well-known/oauth-authorization-server":
+            _log.info("OAUTH authorization-server metadata")
             host = self.headers.get("Host", "localhost")
             base = f"http://{host}"
             self._oauth_respond(200, {
@@ -231,6 +246,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/oauth/authorize":
+            _log.info("OAUTH authorize  query=%s", urlparse(self.path).query)
             qs = parse_qs(urlparse(self.path).query)
             redirect_uri = qs.get("redirect_uri", [""])[0]
             state = qs.get("state", [""])[0]
@@ -255,9 +271,15 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        auth_hdr = self.headers.get("Authorization", "")
+        _log.info("POST %s  Host=%s  Origin=%s  Auth=%s",
+                  self.path, self.headers.get("Host", "-"),
+                  self.headers.get("Origin", "-"),
+                  auth_hdr[:30] + "..." if len(auth_hdr) > 30 else auth_hdr or "-")
 
         # OAuth token & registration — served before API auth check
         if path == "/oauth/token":
+            _log.info("OAUTH token request")
             self._read_body()
             self._oauth_respond(200, {
                 "access_token": str(uuid.uuid4()),
@@ -269,6 +291,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/oauth/register":
+            _log.info("OAUTH client registration")
             raw = self._read_body()
             req = json.loads(raw) if raw else {}
             self._oauth_respond(200, {
@@ -350,6 +373,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         return data
 
     def _handle_sse_get(self):
+        _log.info("SSE connection opening")
         # Create SSE connection wrapper
         conn = _McpSseConnection(self.wfile)
         self.mcp_server._sse_connections[conn.session_id] = conn
@@ -404,6 +428,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 del self.mcp_server._sse_connections[conn.session_id]
 
     def _handle_sse_post(self, body: bytes):
+        _log.info("SSE POST  body_preview=%s", body[:200].decode("utf-8", errors="replace"))
         query_params = parse_qs(urlparse(self.path).query)
         session_id = query_params.get("session", [None])[0]
         if session_id is None:
@@ -443,6 +468,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_mcp_post(self, body: bytes):
+        _log.info("MCP POST  body_preview=%s", body[:200].decode("utf-8", errors="replace"))
         request_method: str | None = None
         try:
             parsed = json.loads(body)
@@ -556,6 +582,14 @@ class McpServer:
         return self.prompts.method(func)
 
     def serve(self, host: str, port: int, *, background = True, request_handler = McpHttpRequestHandler):
+        # Ensure MCP request logging is visible
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="[MCP] %(asctime)s %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        )
+        _log.setLevel(logging.DEBUG)
+
         if self._running:
             print("[MCP] Server is already running")
             return
@@ -693,6 +727,7 @@ class McpServer:
 
     def _mcp_initialize(self, protocolVersion: str, capabilities: dict, clientInfo: dict, _meta: dict | None = None) -> dict:
         """MCP initialize method"""
+        _log.info("INITIALIZE  client=%s  proto=%s  caps=%s", clientInfo, protocolVersion, capabilities)
         return {
             "protocolVersion": getattr(self._protocol_version, "data", protocolVersion),
             "capabilities": {
@@ -719,6 +754,7 @@ class McpServer:
             if tool_group and tool_group not in enabled:
                 continue  # Skip tools from disabled extension groups
             tools.append(self._generate_tool_schema(func_name, func))
+        _log.info("TOOLS/LIST  returning %d tools", len(tools))
         return {"tools": tools}
 
     def _get_tool_extension(self, func_name: str) -> str | None:
