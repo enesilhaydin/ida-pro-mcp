@@ -1102,7 +1102,9 @@ class McpServer:
         }
 
         # Add outputSchema if return type exists and is not None
-        if return_type and return_type is not type(None):
+        # NOTE: outputSchema temporarily disabled for Claude Code compatibility testing.
+        # Claude Code may silently reject tools that include this field.
+        if False and return_type and return_type is not type(None):
             return_schema = self._type_to_json_schema(return_type)
 
             # Wrap non-object returns in a "result" property.
