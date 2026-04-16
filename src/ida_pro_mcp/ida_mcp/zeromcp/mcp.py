@@ -447,7 +447,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
         try:
             # Dispatch to MCP registry
-            setattr(self.mcp_server._protocol_version, "data", "2024-11-05")
+            setattr(self.mcp_server._protocol_version, "data", "2025-06-18")
             response = self.mcp_server.registry.dispatch(body)
         finally:
             setattr(self.mcp_server._enabled_extensions, "data", set())
