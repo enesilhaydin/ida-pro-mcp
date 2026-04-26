@@ -58,6 +58,28 @@ https://github.com/user-attachments/assets/65ed3373-a187-4dd5-a807-425dca1d8ee9
 
 _Note_: You need to load a binary in IDA before the plugin menu will show up.
 
+### Platform-specific notes
+
+**macOS**
+
+- The plugin installs into `~/.idapro/plugins/` (shared across all IDA versions).
+- IDA bundles live in `/Applications/IDA Professional <version>.app/`. The installer auto-detects them and prints the bundles it finds at the end of `--install`.
+- If IDA uses the wrong Python interpreter, run the `idapyswitch` from inside the bundle:
+  ```sh
+  sudo "/Applications/IDA Professional 9.3.app/Contents/MacOS/idapyswitch" --switch-to-python3
+  ```
+- For remote access (other machines on the LAN), the server already binds to `0.0.0.0:13337`. No firewall holes needed for localhost-only use.
+
+**Windows**
+
+- Plugin installs into `%APPDATA%\Hex-Rays\IDA Pro\plugins\`.
+- Use `pip install --force-reinstall <github zip>` for upgrades; pip's cached metadata can otherwise skip a reinstall.
+
+**Linux**
+
+- Plugin installs into `~/.idapro/plugins/`.
+- If `idat` doesn't see the right Python, run `idapyswitch` from `/opt/idapro/` or wherever IDA is installed.
+
 ## Prompt Engineering
 
 LLMs are prone to hallucinations and you need to be specific with your prompting. For reverse engineering the conversion between integers and bytes are especially problematic. Below is a minimal example prompt, feel free to start a discussion or open an issue if you have good results with a different prompt:
@@ -377,6 +399,40 @@ Tools for automated vulnerability discovery, crackme solving, and security resea
 - `segment_xrefs(from_segment, to_segment)`: Cross-segment reference analysis.
 - `detect_libs(confidence_min)`: FLIRT/signature library detection with version grouping.
 - `nop_range(addr, count)`: NOP out instructions for crackme patching (unsafe).
+- `exception_handlers(func)`: Enumerate SEH/EH frames (PE `.pdata`, ELF `.eh_frame`) — critical for Windows binary analysis.
+
+## Advanced Analysis (HIGH/MEDIUM gaps)
+
+Recently added tools targeting RE/bug bounty workflows.
+
+**Call Graph & Control Flow:**
+- `callers(funcs)`: List all callers of one or more functions (symmetric to `callees`).
+- `find_paths(func, src, dst, max_paths)`: Enumerate basic-block paths between two addresses within a function.
+- `dominator_tree(func)`: Compute dominator tree for a function's CFG (path feasibility, slice analysis).
+- `dead_blocks(func)`: Identify unreachable basic blocks (catches obfuscator-inserted dead code).
+- `switch_cases(addr)`: Decode switch jump tables — cases, targets, default branch.
+- `indirect_call_targets(addr)`: Resolved targets for an indirect call site.
+
+**Names & Imports:**
+- `name_search(pattern, limit)`: Regex search across all names (functions, globals, labels).
+- `string_xrefs(pattern, limit)`: Find every function that references strings matching a pattern.
+- `import_at(addr)`: Resolve GOT/PLT/import address to module + symbol + ordinal.
+- `idb_info()`: One-shot session metadata (IDA version, arch, bitness, compiler, base, entry).
+
+**Decompiler Comments:**
+- `decompiler_comments(func, ops)`: Batch read/write/delete pseudocode-level comments (distinct from disasm comments).
+
+**Type Library:**
+- `export_header(output_path, filter)`: Export local types as a C header for use with other tools.
+
+**Lumina (IDA 9.3+):**
+- `lumina_query(addrs)`: Query Lumina for suggested function names without applying.
+- `lumina_pull(funcs)`: Pull and apply Lumina names for unrecognized functions.
+- `lumina_push(funcs)`: Push local function metadata to the Lumina server.
+
+**Microcode Manipulation (IDA 9.3+):**
+- `microcode_insert_assertion(func, addr, reg, value)`: Inject a constant value to steer decompilation past obfuscation.
+- `microcode_delete_insn(func, addr)`: Remove a microinstruction with automatic CFG repair.
 
 ## Debugger Operations (Extension)
 
