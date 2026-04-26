@@ -41,6 +41,13 @@ from . import api_ctree
 from . import api_microcode
 from . import api_vuln
 from . import api_segments
+from . import api_paths
+
+# api_lumina requires IDA 9.3+; skip gracefully on older versions
+try:
+    from . import api_lumina
+except Exception:
+    api_lumina = None  # type: ignore[assignment]
 
 # Re-export key components for external use
 from .sync import idasync, IDAError, IDASyncError, CancelledError
@@ -71,6 +78,8 @@ __all__ = [
     "api_microcode",
     "api_vuln",
     "api_segments",
+    "api_paths",
+    "api_lumina",
     # Re-exported components
     "idasync",
     "IDAError",
