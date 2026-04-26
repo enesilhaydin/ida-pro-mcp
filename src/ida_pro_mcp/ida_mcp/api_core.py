@@ -1013,7 +1013,30 @@ def idb_info() -> IdbInfoResult:
     Useful at the start of a reverse-engineering session to orient an LLM client
     about the target binary without requiring multiple separate queries.
     """
-    info = idaapi.get_inf_structure()
+    # IDA 9.x removed get_inf_structure(); use ida_ida module functions instead.
+    # Fall back to legacy struct on 8.x.
+    import ida_ida
+    legacy_info = None
+    if hasattr(idaapi, "get_inf_structure"):
+        try:
+            legacy_info = idaapi.get_inf_structure()
+        except Exception:
+            legacy_info = None
+
+    def _inf(attr_fn_name, legacy_attr, default=0):
+        fn = getattr(ida_ida, attr_fn_name, None)
+        if fn is not None:
+            try:
+                return fn()
+            except Exception:
+                pass
+        if legacy_info is not None and hasattr(legacy_info, legacy_attr):
+            try:
+                v = getattr(legacy_info, legacy_attr)
+                return v() if callable(v) else v
+            except Exception:
+                pass
+        return default
 
     # Architecture name
     arch = "unknown"
@@ -1027,7 +1050,9 @@ def idb_info() -> IdbInfoResult:
             pass
 
     # Bitness
-    bitness = 64 if info.is_64bit() else (32 if info.is_32bit() else 16)
+    is_64 = bool(_inf("inf_is_64bit", "is_64bit", False))
+    is_32 = bool(_inf("inf_is_32bit_exactly", "is_32bit", False))
+    bitness = 64 if is_64 else (32 if is_32 else 16)
 
     # File format (loader name)
     file_format = "unknown"
@@ -1037,26 +1062,19 @@ def idb_info() -> IdbInfoResult:
         pass
 
     # Compiler info
-    compiler = "unknown"
-    try:
-        cc = info.cc
-        compiler_id = cc.id if hasattr(cc, "id") else 0
-        _CC_MAP = {
-            0: "unknown", 1: "ms", 2: "bc", 3: "watcom",
-            6: "gnu", 7: "visage", 8: "delphi",
-        }
-        compiler = _CC_MAP.get(compiler_id, f"cc#{compiler_id}")
-    except Exception:
-        pass
+    _CC_MAP = {
+        0: "unknown", 1: "ms", 2: "bc", 3: "watcom",
+        6: "gnu", 7: "visage", 8: "delphi",
+    }
+    compiler_id = _inf("inf_get_cc_id", "cc", 0)
+    if hasattr(compiler_id, "id"):
+        compiler_id = compiler_id.id
+    compiler = _CC_MAP.get(int(compiler_id) if isinstance(compiler_id, int) else 0, f"cc#{compiler_id}")
 
     # OS
-    os_name = "unknown"
-    try:
-        ostype = info.ostype if hasattr(info, "ostype") else 0
-        _OS_MAP = {0: "unknown", 1: "msdos", 2: "win", 3: "os2", 4: "netware", 8: "unix"}
-        os_name = _OS_MAP.get(ostype, f"os#{ostype}")
-    except Exception:
-        pass
+    _OS_MAP = {0: "unknown", 1: "msdos", 2: "win", 3: "os2", 4: "netware", 8: "unix"}
+    ostype = _inf("inf_get_ostype", "ostype", 0)
+    os_name = _OS_MAP.get(ostype, f"os#{ostype}")
 
     # Entry point
     entry_point = "none"
@@ -1080,8 +1098,8 @@ def idb_info() -> IdbInfoResult:
         "compiler": compiler,
         "os": os_name,
         "image_base": hex(idaapi.get_imagebase()),
-        "min_ea": hex(info.min_ea),
-        "max_ea": hex(info.max_ea),
+        "min_ea": hex(_inf("inf_get_min_ea", "min_ea", 0)),
+        "max_ea": hex(_inf("inf_get_max_ea", "max_ea", 0)),
         "entry_point": entry_point,
         "input_file": ida_nalt.get_input_file_path() or "",
         "idb_path": idc.get_idb_path() or "",
