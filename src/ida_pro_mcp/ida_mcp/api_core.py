@@ -979,3 +979,189 @@ def detect_libs(
         "lumina_available": lumina_available,
         "lumina_matches": lumina_matches,
     }
+
+
+# ============================================================================
+# idb_info: IDB metadata summary
+# ============================================================================
+
+
+class IdbInfoResult(TypedDict, total=False):
+    ida_version: str
+    file_format: str
+    arch: str
+    bitness: int
+    compiler: str
+    os: str
+    image_base: str
+    min_ea: str
+    max_ea: str
+    entry_point: str
+    input_file: str
+    idb_path: str
+    segments: int
+    functions: int
+    names: int
+
+
+@tool
+@idasync
+def idb_info() -> IdbInfoResult:
+    """Return a structured summary of the current IDB: architecture, bitness, compiler,
+    OS, image base, entry point, file format, and basic statistics.
+
+    Useful at the start of a reverse-engineering session to orient an LLM client
+    about the target binary without requiring multiple separate queries.
+    """
+    info = idaapi.get_inf_structure()
+
+    # Architecture name
+    arch = "unknown"
+    try:
+        ph = idaapi.ph
+        arch = ph.short_name if hasattr(ph, "short_name") else str(ph.id)
+    except Exception:
+        try:
+            arch = idc.get_inf_attr(idc.INF_PROCNAME) or "unknown"
+        except Exception:
+            pass
+
+    # Bitness
+    bitness = 64 if info.is_64bit() else (32 if info.is_32bit() else 16)
+
+    # File format (loader name)
+    file_format = "unknown"
+    try:
+        file_format = idaapi.get_file_type_name() or "unknown"
+    except Exception:
+        pass
+
+    # Compiler info
+    compiler = "unknown"
+    try:
+        cc = info.cc
+        compiler_id = cc.id if hasattr(cc, "id") else 0
+        _CC_MAP = {
+            0: "unknown", 1: "ms", 2: "bc", 3: "watcom",
+            6: "gnu", 7: "visage", 8: "delphi",
+        }
+        compiler = _CC_MAP.get(compiler_id, f"cc#{compiler_id}")
+    except Exception:
+        pass
+
+    # OS
+    os_name = "unknown"
+    try:
+        ostype = info.ostype if hasattr(info, "ostype") else 0
+        _OS_MAP = {0: "unknown", 1: "msdos", 2: "win", 3: "os2", 4: "netware", 8: "unix"}
+        os_name = _OS_MAP.get(ostype, f"os#{ostype}")
+    except Exception:
+        pass
+
+    # Entry point
+    entry_point = "none"
+    entries = list(idautils.Entries())
+    if entries:
+        try:
+            entry_point = hex(entries[0][2])
+        except Exception:
+            pass
+
+    # Basic stats
+    seg_count = sum(1 for _ in idautils.Segments())
+    func_count = sum(1 for _ in idautils.Functions())
+    name_count = sum(1 for _ in idautils.Names())
+
+    result: IdbInfoResult = {
+        "ida_version": idaapi.get_kernel_version(),
+        "file_format": file_format,
+        "arch": arch,
+        "bitness": bitness,
+        "compiler": compiler,
+        "os": os_name,
+        "image_base": hex(idaapi.get_imagebase()),
+        "min_ea": hex(info.min_ea),
+        "max_ea": hex(info.max_ea),
+        "entry_point": entry_point,
+        "input_file": ida_nalt.get_input_file_path() or "",
+        "idb_path": idc.get_idb_path() or "",
+        "segments": seg_count,
+        "functions": func_count,
+        "names": name_count,
+    }
+    return result
+
+
+# ============================================================================
+# import_at: resolve import by address
+# ============================================================================
+
+
+class ImportAtResult(TypedDict, total=False):
+    addr: str
+    module: str
+    name: str
+    ordinal: int
+    error: str
+
+
+@tool
+@idasync
+def import_at(
+    addrs: Annotated[
+        str | list[str],
+        "Address(es) to resolve as import entries (hex, decimal, or name). "
+        "Accepts a single address, comma-separated string, or list.",
+    ],
+) -> list[ImportAtResult]:
+    """Resolve one or more addresses to their import table entry (module + symbol name).
+
+    Looks up the given address(es) in the IDB import table and returns the
+    originating DLL/shared library module name, the imported symbol name, and
+    ordinal (if available). Returns an error entry for addresses not found in
+    the import table.
+
+    Useful when tracing a call through a GOT/PLT stub to identify the actual
+    external function being called (e.g. during vulnerability research).
+    """
+    from .utils import normalize_list_input
+
+    if isinstance(addrs, str):
+        addr_list = normalize_list_input(addrs)
+    else:
+        addr_list = list(addrs)
+
+    # Build a full ea → (module, name, ordinal) map once
+    import_map: dict[int, tuple[str, str, int]] = {}
+    nimps = ida_nalt.get_import_module_qty()
+    for i in range(nimps):
+        module_name = ida_nalt.get_import_module_name(i) or "<unnamed>"
+
+        def _cb(ea: int, sym: str | None, ordinal: int, _mod=module_name) -> bool:
+            sym_name = sym if sym else f"#{ordinal}"
+            import_map[ea] = (_mod, sym_name, ordinal)
+            return True
+
+        ida_nalt.enum_import_names(i, _cb)
+
+    results: list[ImportAtResult] = []
+    for addr_str in addr_list:
+        try:
+            ea = parse_address(addr_str)
+            if ea in import_map:
+                mod, sym, ord_ = import_map[ea]
+                results.append({
+                    "addr": hex(ea),
+                    "module": mod,
+                    "name": sym,
+                    "ordinal": ord_,
+                })
+            else:
+                results.append({
+                    "addr": hex(ea),
+                    "error": f"Address {hex(ea)} is not an import entry",
+                })
+        except Exception as e:
+            results.append({"addr": addr_str, "error": str(e)})
+
+    return results
