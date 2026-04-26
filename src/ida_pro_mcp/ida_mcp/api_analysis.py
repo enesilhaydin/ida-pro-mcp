@@ -1,4 +1,5 @@
 from itertools import islice
+import re
 import struct
 from typing import Annotated, Any, NotRequired, Optional, TypedDict
 import ida_lines
@@ -13,6 +14,7 @@ import ida_idaapi
 import ida_xref
 import ida_ua
 import ida_name
+import idc
 from .rpc import tool
 from .sync import idasync, tool_timeout, IDAError
 from .utils import (
@@ -319,6 +321,74 @@ class CallGraphResult(TypedDict, total=False):
     max_edges: int
     max_edges_per_func: int
     per_func_capped: bool
+    error: str
+
+
+class CallerItem(TypedDict):
+    func_name: str
+    addr: str
+
+
+class CallersResult(TypedDict, total=False):
+    addr: str
+    callers: list[CallerItem]
+    error: str
+
+
+class NameSearchItem(TypedDict):
+    addr: str
+    name: str
+    type: str
+
+
+class NameSearchResult(TypedDict, total=False):
+    pattern: str
+    matches: list[NameSearchItem]
+    count: int
+    error: str
+
+
+class StringXrefCaller(TypedDict):
+    addr: str
+    func_name: str
+
+
+class StringXrefItem(TypedDict):
+    string: str
+    addr: str
+    callers: list[StringXrefCaller]
+
+
+class StringXrefsResult(TypedDict, total=False):
+    pattern: str
+    matches: list[StringXrefItem]
+    count: int
+    error: str
+
+
+class SwitchCaseItem(TypedDict):
+    value: int
+    target: str
+
+
+class SwitchInfoResult(TypedDict, total=False):
+    addr: str
+    jumps: list[SwitchCaseItem]
+    default: str | None
+    ncases: int
+    regnum: int
+    error: str
+
+
+class IndirectCallTarget(TypedDict):
+    target_addr: str
+    target_name: str
+    confidence: str
+
+
+class IndirectCallTargetsResult(TypedDict, total=False):
+    addr: str
+    targets: list[IndirectCallTarget]
     error: str
 
 
@@ -2278,3 +2348,253 @@ def callgraph(
             results.append({"root": root, "error": str(e), "nodes": [], "edges": []})
 
     return results
+
+
+# ============================================================================
+# Group 1: callers / name_search / string_xrefs
+# ============================================================================
+
+
+@tool
+@idasync
+def callers(
+    addrs: Annotated[
+        list[str] | str,
+        "Function addresses or names to find callers for (comma-separated string or list)",
+    ],
+    limit: Annotated[int, "Max callers per function (default: 200, max: 1000)"] = 200,
+) -> list[CallersResult]:
+    """Return all functions that call the given function(s).
+
+    Symmetric counterpart to 'callees'. Walks code xrefs to each function's
+    start address, filters to actual call instructions, and deduplicates by
+    caller function start address.
+
+    Each result item contains: addr (queried address), callers list of
+    {func_name, addr} dicts.
+    """
+    addrs = normalize_list_input(addrs)
+    if limit <= 0 or limit > 1000:
+        limit = 1000
+
+    results: list[CallersResult] = []
+    for fn_addr in addrs:
+        try:
+            ea = parse_address(fn_addr)
+            func = idaapi.get_func(ea)
+            if not func:
+                results.append({"addr": fn_addr, "callers": [], "error": "No function found"})
+                continue
+
+            raw = _collect_callers_for_function(func)
+            limited, _ = _limit_items(raw, limit)
+            caller_items: list[CallerItem] = [
+                CallerItem(func_name=c["name"], addr=c["addr"]) for c in limited
+            ]
+            results.append({"addr": fn_addr, "callers": caller_items})
+        except Exception as e:
+            results.append({"addr": fn_addr, "callers": [], "error": str(e)})
+
+    return results
+
+
+@tool
+@idasync
+def name_search(
+    pattern: Annotated[str, "Regex pattern to match against IDB names (functions, globals, labels)"],
+    limit: Annotated[int, "Max results (default: 200, max: 2000)"] = 200,
+) -> NameSearchResult:
+    """Search all IDB names (functions, globals, labels) by regex pattern.
+
+    Iterates idautils.Names() and applies the regex. Returns list of
+    {addr, name, type} where type is 'function', 'import', or 'name'.
+
+    Returns an error key if the pattern is an invalid regex.
+    """
+    if limit <= 0 or limit > 2000:
+        limit = 2000
+
+    try:
+        compiled = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        return NameSearchResult(
+            pattern=pattern,
+            matches=[],
+            count=0,
+            error=f"Invalid regex: {e}",
+        )
+
+    matches: list[NameSearchItem] = []
+    for ea, name in idautils.Names():
+        if len(matches) >= limit:
+            break
+        if not compiled.search(name):
+            continue
+        # Classify the name
+        if idaapi.get_func(ea) is not None:
+            kind = "function"
+        elif ida_name.get_name_flags(ea) & ida_name.NT_FLD:
+            kind = "import"
+        else:
+            kind = "name"
+        matches.append(NameSearchItem(addr=hex(ea), name=name, type=kind))
+
+    return NameSearchResult(pattern=pattern, matches=matches, count=len(matches))
+
+
+@tool
+@idasync
+def string_xrefs(
+    pattern: Annotated[str, "Substring or regex pattern to match string contents"],
+    limit: Annotated[int, "Max string entries to inspect (default: 100, max: 500)"] = 100,
+) -> StringXrefsResult:
+    """Find all functions that reference strings matching a pattern.
+
+    For every IDB string whose content matches 'pattern' (regex or substring),
+    collects all data cross-references to that string and resolves them to
+    enclosing function names.
+
+    Returns list of {string, addr, callers: [{addr, func_name}]}.
+    The 'pattern' is tried as regex first; if invalid, falls back to
+    case-insensitive substring match.
+    """
+    if limit <= 0 or limit > 500:
+        limit = 500
+
+    try:
+        compiled: re.Pattern | None = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        compiled = None
+
+    def _matches(text: str) -> bool:
+        if compiled is not None:
+            return bool(compiled.search(text))
+        return pattern.lower() in text.lower()
+
+    matches: list[StringXrefItem] = []
+    count = 0
+
+    for s in idautils.Strings():
+        if count >= limit:
+            break
+        try:
+            content = idc.get_strlit_contents(s.ea)
+            if not content:
+                continue
+            text = content.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        if not _matches(text):
+            continue
+
+        count += 1
+        callers_list: list[StringXrefCaller] = []
+        seen_funcs: set[int] = set()
+        for xref in idautils.DataRefsTo(s.ea):
+            fn = idaapi.get_func(xref)
+            if fn and fn.start_ea not in seen_funcs:
+                seen_funcs.add(fn.start_ea)
+                fname = ida_funcs.get_func_name(fn.start_ea) or "<unnamed>"
+                callers_list.append(
+                    StringXrefCaller(addr=hex(xref), func_name=fname)
+                )
+
+        matches.append(StringXrefItem(string=text, addr=hex(s.ea), callers=callers_list))
+
+    return StringXrefsResult(pattern=pattern, matches=matches, count=len(matches))
+
+
+# ============================================================================
+# Group 2: switch_cases / indirect_call_targets
+# ============================================================================
+
+
+@tool
+@idasync
+def switch_cases(
+    addr: Annotated[str, "Address of or within a switch jump instruction"],
+) -> SwitchInfoResult:
+    """Decode a switch table at the given address.
+
+    Uses ida_nalt.get_switch_info() to retrieve the switch_info_t structure,
+    then resolves each case value to its jump target address.
+
+    Returns {jumps: [{value, target}], default, ncases, regnum}.
+    If no switch table exists at the address, returns {error: ...}.
+    """
+    try:
+        ea = parse_address(addr)
+        si = ida_nalt.switch_info_t()
+        if not ida_nalt.get_switch_info(si, ea):
+            return SwitchInfoResult(addr=addr, error="No switch table found at address")
+
+        jumps: list[SwitchCaseItem] = []
+        # Iterate over each case: case values run from 0 to ncases-1 (may be offset by si.lowcase)
+        for i in range(si.ncases):
+            case_val = si.lowcase + i
+            target_ea = idc.calc_switch_cases(ea, i)
+            if target_ea is None or target_ea == idaapi.BADADDR:
+                # Fall back: read jump table directly
+                jtable_ea = si.jumps + i * si.get_jtable_element_size()
+                target_ea = jtable_ea
+            jumps.append(SwitchCaseItem(value=case_val, target=hex(target_ea)))
+
+        default_ea = si.defjump if si.defjump != idaapi.BADADDR else None
+
+        return SwitchInfoResult(
+            addr=addr,
+            jumps=jumps,
+            default=hex(default_ea) if default_ea is not None else None,
+            ncases=si.ncases,
+            regnum=si.regnum,
+        )
+    except Exception as e:
+        return SwitchInfoResult(addr=addr, error=str(e))
+
+
+@tool
+@idasync
+def indirect_call_targets(
+    addr: Annotated[str, "Address of an indirect call instruction (e.g. call rax, call [rbx])"],
+) -> IndirectCallTargetsResult:
+    """List all known resolved targets for an indirect call site.
+
+    Uses IDA's xref database to find code references *from* the call site.
+    IDA records resolved indirect call targets as fl_CN (near call) or
+    fl_CF (far call) xrefs when the target is known (e.g. via type propagation,
+    FLIRT, or Lumina).
+
+    Returns list of {target_addr, target_name, confidence} where confidence is
+    'high' for direct refs or 'low' for indirect/computed refs.
+    """
+    try:
+        ea = parse_address(addr)
+        targets: list[IndirectCallTarget] = []
+        seen: set[int] = set()
+
+        xb = ida_xref.xrefblk_t()
+        ok = xb.first_from(ea, ida_xref.XREF_ALL)
+        while ok:
+            if xb.iscode and xb.to not in seen:
+                seen.add(xb.to)
+                xtype = xb.type
+                # fl_CN = 0x15 (near call), fl_CF = 0x17 (far call)
+                # fl_JN = 0x13 (near jump), fl_JF = 0x15 (far jump)
+                if xtype in (ida_xref.fl_CN, ida_xref.fl_CF, ida_xref.fl_JN, ida_xref.fl_JF):
+                    confidence = "high"
+                else:
+                    confidence = "low"
+                tname = ida_name.get_name(xb.to) or "<unnamed>"
+                targets.append(
+                    IndirectCallTarget(
+                        target_addr=hex(xb.to),
+                        target_name=tname,
+                        confidence=confidence,
+                    )
+                )
+            ok = xb.next_from()
+
+        return IndirectCallTargetsResult(addr=addr, targets=targets)
+    except Exception as e:
+        return IndirectCallTargetsResult(addr=addr, targets=[], error=str(e))
