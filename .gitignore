@@ -38,4 +38,6 @@ scalene-profile.json
 
 # AI assistant files
 CLAUDE.md
-docs/superpowers/
+docs/
+skills/
+mcp-config-example.txt
