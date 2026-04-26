@@ -424,6 +424,37 @@ def _get_ida_user_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".idapro")
 
 
+def _find_macos_ida_apps() -> list[str]:
+    """Return sorted list of IDA app bundle paths found in /Applications on macOS."""
+    if sys.platform != "darwin":
+        return []
+    found = glob.glob("/Applications/IDA*.app") + glob.glob("/Applications/IDA Professional*.app")
+    # Deduplicate (glob patterns can overlap) and sort for deterministic order
+    return sorted(set(found))
+
+
+def _print_macos_ida_notice(quiet: bool) -> None:
+    """On macOS, detect IDA installations and print a helpful notice."""
+    if sys.platform != "darwin" or quiet:
+        return
+    apps = _find_macos_ida_apps()
+    if not apps:
+        print(
+            "Note: No IDA installation found under /Applications/IDA*.app. "
+            "Make sure IDA Pro is installed there so the plugin can be loaded."
+        )
+        return
+    print(f"Detected IDA installation{'s' if len(apps) > 1 else ''}:")
+    for app in apps:
+        idapyswitch = os.path.join(app, "Contents", "MacOS", "idapyswitch")
+        if os.path.exists(idapyswitch):
+            print(f"  {app}")
+            print(f"    To ensure the correct Python is used, run:")
+            print(f"    sudo \"{idapyswitch}\" --switch-to-python3")
+        else:
+            print(f"  {app}")
+
+
 def _remove_path(path: str) -> None:
     if not os.path.lexists(path):
         return
@@ -513,6 +544,7 @@ def install_ida_plugin(
                 print(f"  {item}")
         else:
             print("Skipping IDA plugin installation (already up to date)")
+        _print_macos_ida_notice(quiet)
 
 
 def _resolve_transport(value: str) -> str:
