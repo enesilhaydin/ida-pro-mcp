@@ -1,13 +1,16 @@
-"""Segment API - list segments and analyze cross-references between segments."""
+"""Segment API - list segments, cross-references, and exception handler enumeration."""
 
 from typing import Annotated, NotRequired, TypedDict
 
 import idaapi
 import idautils
+import ida_bytes
+import ida_nalt
 import ida_segment
 
 from .rpc import tool
 from .sync import idasync
+from .utils import parse_address
 
 
 class SegmentInfo(TypedDict):
@@ -190,3 +193,205 @@ def segment_xrefs(
             "by_direction": by_direction,
         },
     }
+
+
+# ============================================================================
+# Exception Handler Enumeration
+# ============================================================================
+
+
+class ExceptionHandlerItem(TypedDict, total=False):
+    func_start: str
+    func_end: str
+    handler: str
+    handler_name: str
+    unwind_info: str
+    format: str  # "pdata" | "eh_frame" | "unknown"
+
+
+class ExceptionHandlersResult(TypedDict):
+    handlers: list[ExceptionHandlerItem]
+    count: int
+    format: str
+    warning: NotRequired[str]
+
+
+def _read_dword(ea: int) -> int | None:
+    """Read a 4-byte little-endian value, returning None if unloaded."""
+    if not ida_bytes.is_loaded(ea):
+        return None
+    return ida_bytes.get_dword(ea)
+
+
+def _read_qword(ea: int) -> int | None:
+    if not ida_bytes.is_loaded(ea):
+        return None
+    return ida_bytes.get_qword(ea)
+
+
+def _parse_pdata_x64(pdata_seg, image_base: int) -> list[ExceptionHandlerItem]:
+    """Parse Windows x64 .pdata section into RUNTIME_FUNCTION entries."""
+    handlers: list[ExceptionHandlerItem] = []
+    ea = pdata_seg.start_ea
+    end_ea = pdata_seg.end_ea
+
+    while ea + 12 <= end_ea:
+        begin_rva = _read_dword(ea)
+        end_rva = _read_dword(ea + 4)
+        unwind_rva = _read_dword(ea + 8)
+
+        if begin_rva is None or end_rva is None or unwind_rva is None:
+            break
+
+        if begin_rva == 0:
+            ea += 12
+            continue
+
+        func_start = image_base + begin_rva
+        func_end = image_base + end_rva
+        unwind_ea = image_base + (unwind_rva & ~3)  # mask off chain flag
+
+        handler_name = idaapi.get_name(func_start) or ""
+
+        item = ExceptionHandlerItem(
+            func_start=hex(func_start),
+            func_end=hex(func_end),
+            handler=hex(unwind_ea),
+            handler_name=handler_name,
+            unwind_info=hex(unwind_ea),
+            format="pdata",
+        )
+        handlers.append(item)
+        ea += 12
+
+    return handlers
+
+
+def _parse_eh_frame(eh_frame_seg) -> list[ExceptionHandlerItem]:
+    """Parse ELF .eh_frame section for CIE/FDE entries."""
+    handlers: list[ExceptionHandlerItem] = []
+    ea = eh_frame_seg.start_ea
+    end_ea = eh_frame_seg.end_ea
+
+    while ea + 8 <= end_ea:
+        length = _read_dword(ea)
+        if length is None or length == 0:
+            break
+
+        # CIE_id: 0 means CIE, non-zero means FDE
+        cie_id = _read_dword(ea + 4)
+        if cie_id is None:
+            break
+
+        entry_end = ea + 4 + length
+        if entry_end > end_ea:
+            break
+
+        if cie_id != 0:
+            # FDE: pc_begin is at ea+8 (relative or absolute depending on encoding)
+            pc_begin_raw = _read_dword(ea + 8)
+            if pc_begin_raw is not None:
+                # For PC-relative encoding: pc_begin = (ea+8) + signed_offset
+                pc_begin = (ea + 8 + pc_begin_raw) & 0xFFFFFFFFFFFFFFFF
+                func_name = idaapi.get_name(pc_begin) or ""
+                handlers.append(ExceptionHandlerItem(
+                    func_start=hex(pc_begin),
+                    func_end=hex(pc_begin),  # end requires parsing pc_range
+                    handler=hex(ea),
+                    handler_name=func_name,
+                    unwind_info=hex(ea),
+                    format="eh_frame",
+                ))
+
+        ea = entry_end
+
+    return handlers
+
+
+def _get_image_base() -> int:
+    """Get the image base from the IDB."""
+    try:
+        import ida_ida
+        return ida_ida.inf_get_min_ea() & ~0xFFFF
+    except Exception:
+        return 0
+
+
+@tool
+@idasync
+def exception_handlers(
+    func: Annotated[
+        str | None,
+        "Function address/name to filter to, or null/empty to return all handlers",
+    ] = None,
+) -> ExceptionHandlersResult:
+    """Enumerate SEH/EH exception handler frames in the binary.
+
+    For Windows PE binaries: parses the .pdata section (x64 RUNTIME_FUNCTION
+    array) to enumerate structured exception handlers.
+
+    For ELF binaries: parses the .eh_frame section for DWARF CFI FDE entries.
+
+    When 'func' is specified, filters results to the function covering that
+    address. When null/empty, returns all handlers found.
+
+    Returns list of {func_start, func_end, handler, handler_name, unwind_info,
+    format} dicts. Returns an empty list with a warning if no EH data is found.
+    """
+    import idc
+
+    handlers: list[ExceptionHandlerItem] = []
+    fmt = "unknown"
+    warning: str | None = None
+
+    # Find .pdata (Windows PE x64)
+    pdata_seg = ida_segment.get_segm_by_name(".pdata")
+    eh_frame_seg = ida_segment.get_segm_by_name(".eh_frame")
+
+    if pdata_seg is not None:
+        fmt = "pdata"
+        image_base = _get_image_base()
+        handlers = _parse_pdata_x64(pdata_seg, image_base)
+    elif eh_frame_seg is not None:
+        fmt = "eh_frame"
+        handlers = _parse_eh_frame(eh_frame_seg)
+    else:
+        # Try alternate names
+        for alt in (".xdata", ".pdata$x", "__eh_frame", ".gcc_except_table"):
+            seg = ida_segment.get_segm_by_name(alt)
+            if seg is not None:
+                if alt in (".xdata", ".pdata$x"):
+                    fmt = "pdata"
+                    image_base = _get_image_base()
+                    handlers = _parse_pdata_x64(seg, image_base)
+                else:
+                    fmt = "eh_frame"
+                    handlers = _parse_eh_frame(seg)
+                break
+
+        if not handlers:
+            warning = (
+                "No .pdata or .eh_frame section found. "
+                "This binary may not have structured exception handling data, "
+                "or EH info may be in a non-standard location."
+            )
+
+    # Filter by function if requested
+    if func and func.strip():
+        try:
+            filter_ea = parse_address(func.strip())
+            fn = idaapi.get_func(filter_ea)
+            if fn:
+                fn_start_hex = hex(fn.start_ea)
+                handlers = [h for h in handlers if h.get("func_start") == fn_start_hex]
+            else:
+                # Filter by address range
+                filter_hex = hex(filter_ea)
+                handlers = [h for h in handlers if h.get("func_start") == filter_hex]
+        except Exception:
+            pass
+
+    result = ExceptionHandlersResult(handlers=handlers, count=len(handlers), format=fmt)
+    if warning:
+        result["warning"] = warning
+    return result
