@@ -1,4 +1,4 @@
-from typing import Annotated, Any, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 import idaapi
 import idautils
@@ -15,6 +15,7 @@ from .rpc import tool, unsafe
 from .sync import idasync, IDAError
 from .utils import (
     parse_address,
+    normalize_list_input,
     decompile_checked,
     refresh_decompiler_ctext,
     CommentOp,
@@ -983,5 +984,238 @@ def undefine(items: list[UndefineOp] | UndefineOp) -> list[DefineResult]:
                 )
         except Exception as e:
             results.append({"addr": addr_str, "error": str(e)})
+
+    return results
+
+
+# ============================================================================
+# Decompiler (pseudocode) comment read/write
+# ============================================================================
+
+
+class DecompilerCommentOp(TypedDict, total=False):
+    action: Annotated[str, "get | set | delete"]
+    func: Annotated[str, "Function address or name (required)"]
+    addr: Annotated[str, "Target address for the comment (required for set/delete/get-single)"]
+    text: Annotated[str, "Comment text (required for set)"]
+
+
+class DecompilerCommentResult(TypedDict, total=False):
+    action: str
+    func: str
+    addr: str
+    text: str
+    comments: list[dict]
+    ok: bool
+    error: str
+
+
+@tool
+@idasync
+def decompiler_comments(
+    ops: Annotated[
+        list[DecompilerCommentOp] | DecompilerCommentOp,
+        "List of comment operations: {action, func, addr?, text?}. "
+        "action=get returns all comments for the function; "
+        "action=set writes a pseudocode comment at addr; "
+        "action=delete removes the comment at addr.",
+    ],
+) -> list[DecompilerCommentResult]:
+    """Read or write per-address pseudocode (decompiler) comments stored in the IDB.
+
+    These are the comments visible in the Hex-Rays pseudocode view, persisted via
+    user_cmts_t. They are separate from disassembly comments written by set_comments.
+
+    Operations:
+    - get: returns all decompiler comments for the function (addr optional)
+    - set: write/overwrite comment text at the given address
+    - delete: remove the comment at the given address
+
+    The func parameter accepts an address (hex/decimal) or function name.
+    """
+    if not ida_hexrays.init_hexrays_plugin():
+        return [{"action": "error", "error": "Hex-Rays decompiler not available", "ok": False}]
+
+    if isinstance(ops, dict):
+        ops = [ops]
+
+    results: list[DecompilerCommentResult] = []
+
+    for op in ops:
+        action = str(op.get("action", "get")).lower()
+        func_str = str(op.get("func", "") or "")
+        addr_str = str(op.get("addr", "") or "")
+        text = str(op.get("text", "") or "")
+
+        if not func_str:
+            results.append({"action": action, "error": "func is required", "ok": False})
+            continue
+
+        try:
+            func_ea = parse_address(func_str)
+            fn = idaapi.get_func(func_ea)
+            if fn is None:
+                results.append({
+                    "action": action,
+                    "func": func_str,
+                    "error": f"No function at {func_str}",
+                    "ok": False,
+                })
+                continue
+
+            cfunc = decompile_checked(fn.start_ea)
+
+            if action == "get":
+                # Restore user comments from IDB
+                cmts = ida_hexrays.restore_user_cmts(fn.start_ea)
+                comment_list = []
+                if cmts:
+                    it = cmts.begin()
+                    end = cmts.end()
+                    while it != end:
+                        tl = cmts.first(it)
+                        cmt_obj = cmts.second(it)
+                        entry: dict = {
+                            "addr": hex(tl.ea),
+                            "itp": int(tl.itp),
+                            "text": str(cmt_obj.c_str()),
+                        }
+                        comment_list.append(entry)
+                        it = cmts.next(it)
+                results.append({
+                    "action": "get",
+                    "func": hex(fn.start_ea),
+                    "comments": comment_list,
+                    "ok": True,
+                })
+
+            elif action == "set":
+                if not addr_str:
+                    results.append({
+                        "action": "set",
+                        "func": func_str,
+                        "error": "addr is required for set",
+                        "ok": False,
+                    })
+                    continue
+                if not text:
+                    results.append({
+                        "action": "set",
+                        "func": func_str,
+                        "addr": addr_str,
+                        "error": "text is required for set",
+                        "ok": False,
+                    })
+                    continue
+
+                target_ea = parse_address(addr_str)
+                eamap = cfunc.get_eamap()
+
+                # Find the nearest mapped address
+                nearest_ea = target_ea
+                if target_ea in eamap:
+                    nearest_ea = eamap[target_ea][0].ea
+                else:
+                    # Try to find closest mapped ea
+                    candidates = [ea for ea in eamap if ea <= target_ea]
+                    if candidates:
+                        nearest_ea = eamap[max(candidates)][0].ea
+
+                placed = False
+                tl = idaapi.treeloc_t()
+                tl.ea = nearest_ea
+                for itp in range(idaapi.ITP_SEMI, idaapi.ITP_COLON):
+                    tl.itp = itp
+                    cfunc.set_user_cmt(tl, text)
+                    cfunc.save_user_cmts()
+                    cfunc.refresh_func_ctext()
+                    if not cfunc.has_orphan_cmts():
+                        placed = True
+                        break
+                    cfunc.del_orphan_cmts()
+                    cfunc.save_user_cmts()
+
+                if placed:
+                    results.append({
+                        "action": "set",
+                        "func": hex(fn.start_ea),
+                        "addr": hex(nearest_ea),
+                        "text": text,
+                        "ok": True,
+                    })
+                else:
+                    results.append({
+                        "action": "set",
+                        "func": func_str,
+                        "addr": addr_str,
+                        "error": "Failed to place decompiler comment (address not in pseudocode map)",
+                        "ok": False,
+                    })
+
+            elif action == "delete":
+                if not addr_str:
+                    results.append({
+                        "action": "delete",
+                        "func": func_str,
+                        "error": "addr is required for delete",
+                        "ok": False,
+                    })
+                    continue
+
+                target_ea = parse_address(addr_str)
+                cmts = ida_hexrays.restore_user_cmts(fn.start_ea)
+                if not cmts:
+                    results.append({
+                        "action": "delete",
+                        "func": hex(fn.start_ea),
+                        "addr": hex(target_ea),
+                        "ok": True,  # Nothing to delete
+                    })
+                    continue
+
+                # Find and remove all entries at this ea
+                removed = 0
+                keys_to_remove = []
+                it = cmts.begin()
+                end_it = cmts.end()
+                while it != end_it:
+                    tl = cmts.first(it)
+                    if tl.ea == target_ea:
+                        keys_to_remove.append((tl.ea, int(tl.itp)))
+                    it = cmts.next(it)
+
+                for ea_key, itp_key in keys_to_remove:
+                    tl = idaapi.treeloc_t()
+                    tl.ea = ea_key
+                    tl.itp = itp_key
+                    cmts.erase(tl)
+                    removed += 1
+
+                ida_hexrays.save_user_cmts(fn.start_ea, cmts)
+                cfunc.refresh_func_ctext()
+
+                results.append({
+                    "action": "delete",
+                    "func": hex(fn.start_ea),
+                    "addr": hex(target_ea),
+                    "ok": True,
+                })
+
+            else:
+                results.append({
+                    "action": action,
+                    "func": func_str,
+                    "error": f"Unknown action: {action!r}. Use get/set/delete.",
+                    "ok": False,
+                })
+
+        except Exception as e:
+            results.append({
+                "action": action,
+                "func": func_str,
+                "addr": addr_str,
+                "error": str(e),
+                "ok": False,
+            })
 
     return results
