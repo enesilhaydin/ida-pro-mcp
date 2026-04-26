@@ -2598,3 +2598,122 @@ def indirect_call_targets(
         return IndirectCallTargetsResult(addr=addr, targets=targets)
     except Exception as e:
         return IndirectCallTargetsResult(addr=addr, targets=[], error=str(e))
+
+
+# ============================================================================
+# dead_blocks: unreachable basic block detection
+# ============================================================================
+
+
+class DeadBlock(TypedDict):
+    start: str
+    end: str
+    size: int
+
+
+class DeadBlocksResult(TypedDict, total=False):
+    func: str
+    func_addr: str
+    dead_blocks: list[DeadBlock]
+    total_blocks: int
+    dead_count: int
+    error: str
+
+
+@tool
+@idasync
+def dead_blocks(
+    funcs: Annotated[
+        str | list[str],
+        "Function address(es) or name(s). Accepts a single value, "
+        "comma-separated string, or list.",
+    ],
+) -> list[DeadBlocksResult]:
+    """Identify unreachable (dead) basic blocks within functions.
+
+    Performs a reachability analysis from each function's entry block using the
+    IDA basic-block graph. Returns all blocks that cannot be reached from the
+    entry point — these are candidates for dead code inserted by obfuscators,
+    compiler artefacts, or anti-analysis tricks.
+
+    Returns one result per queried function with:
+    - dead_blocks: list of {start, end, size} for each unreachable block
+    - total_blocks: total basic block count
+    - dead_count: number of unreachable blocks
+    """
+    if isinstance(funcs, str):
+        func_list = normalize_list_input(funcs)
+    else:
+        func_list = list(funcs)
+
+    results: list[DeadBlocksResult] = []
+
+    for func_str in func_list:
+        try:
+            ea = parse_address(func_str)
+            fn = idaapi.get_func(ea)
+            if fn is None:
+                results.append({
+                    "func": func_str,
+                    "dead_blocks": [],
+                    "total_blocks": 0,
+                    "dead_count": 0,
+                    "error": f"No function at {func_str}",
+                })
+                continue
+
+            # Build the basic-block graph via FlowChart
+            fc = idaapi.FlowChart(fn, flags=idaapi.FC_PREDS)
+            all_blocks: list[Any] = list(fc)
+            if not all_blocks:
+                results.append({
+                    "func": func_str,
+                    "func_addr": hex(fn.start_ea),
+                    "dead_blocks": [],
+                    "total_blocks": 0,
+                    "dead_count": 0,
+                })
+                continue
+
+            # BFS / DFS reachability from entry block (index 0)
+            # FlowChart block 0 is always the entry block when FC_PREDS is set
+            entry_block = all_blocks[0]
+            reachable: set[int] = set()
+            stack = [entry_block]
+            while stack:
+                blk = stack.pop()
+                if blk.id in reachable:
+                    continue
+                reachable.add(blk.id)
+                for succ in blk.succs():
+                    if succ.id not in reachable:
+                        stack.append(succ)
+
+            dead: list[DeadBlock] = []
+            for blk in all_blocks:
+                if blk.id not in reachable:
+                    size = blk.end_ea - blk.start_ea
+                    dead.append(DeadBlock(
+                        start=hex(blk.start_ea),
+                        end=hex(blk.end_ea),
+                        size=size,
+                    ))
+
+            results.append({
+                "func": func_str,
+                "func_addr": hex(fn.start_ea),
+                "dead_blocks": dead,
+                "total_blocks": len(all_blocks),
+                "dead_count": len(dead),
+            })
+
+        except Exception as e:
+            results.append({
+                "func": func_str,
+                "dead_blocks": [],
+                "total_blocks": 0,
+                "dead_count": 0,
+                "error": str(e),
+            })
+
+    return results
