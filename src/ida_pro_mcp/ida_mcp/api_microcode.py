@@ -1,9 +1,11 @@
 """Microcode def-use chain analysis tools.
 
-Provides 3 MCP tools:
+Provides 5 MCP tools:
 - mcode_defuse: Extract def-use chains for variables in microcode IR
 - mcode_source: Trace value origin backward through def-use chains
 - mcode_inspect: Dump microcode IR blocks with pagination and filtering
+- microcode_insert_assertion: Inject a constant-value assertion into microcode (IDA 9.3+)
+- microcode_delete_insn: Delete a microinstruction from a block (IDA 9.3+)
 """
 
 from typing import Annotated, NotRequired, TypedDict
@@ -11,8 +13,17 @@ import ida_hexrays
 import idaapi
 
 from .rpc import tool
-from .sync import idasync, IDAError
+from .sync import idasync, IDAError, ida_major, ida_minor
 from .utils import parse_address
+
+
+def _require_ida_93():
+    """Raise IDAError if IDA version < 9.3 (microcode manipulation requires 9.3+)."""
+    if ida_major < 9 or (ida_major == 9 and ida_minor < 3):
+        raise IDAError(
+            f"This tool requires IDA Pro 9.3+. "
+            f"Current version: {ida_major}.{ida_minor}"
+        )
 
 
 # IDA 9.x renamed area_t → range_t; support both
@@ -458,3 +469,161 @@ def mcode_inspect(
         insn_count=total_insns,
         blocks=blocks,
     )
+
+
+# ============================================================================
+# Group 5: microcode_insert_assertion / microcode_delete_insn (IDA 9.3+)
+# ============================================================================
+
+
+class AssertionResult(TypedDict, total=False):
+    func: str
+    addr: str
+    reg: str
+    value: int
+    inserted: bool
+    error: str
+
+
+class DeleteInsnResult(TypedDict, total=False):
+    func: str
+    addr: str
+    deleted: bool
+    text: str
+    error: str
+
+
+@tool
+@idasync
+def microcode_insert_assertion(
+    func: Annotated[str, "Function address or name (e.g. 0x401000 or main)"],
+    addr: Annotated[str, "Address within the function where assertion is inserted"],
+    reg: Annotated[str, "Register name to constrain (e.g. 'eax', 'rdi')"],
+    value: Annotated[int, "Constant value to assert for the register"],
+) -> AssertionResult:
+    """Inject a constant-value microcode assertion for a register at an address (IDA 9.3+).
+
+    Inserts a 'mov #value, reg' microinstruction into the microcode block
+    containing 'addr'. This constrains the decompiler's value analysis and can
+    steer decompilation past obfuscation or help resolve indirect control flow.
+
+    Requires IDA Pro 9.3+ (mblock_t.insert_into_block API).
+    The function is re-decompiled after insertion to commit the change.
+    """
+    _require_ida_93()
+
+    try:
+        fn_ea = parse_address(func)
+        fn = idaapi.get_func(fn_ea)
+        if fn is None:
+            return AssertionResult(func=func, addr=addr, reg=reg, value=value,
+                                   inserted=False, error="Function not found")
+
+        target_ea = parse_address(addr)
+        mat = _MATURITY_MAP["MMAT_GLBOPT1"]
+        mba = _get_mba(fn_ea, mat)
+
+        # Find the mblock containing target_ea
+        target_block = None
+        target_insn = None
+        for blk_idx in range(mba.qty):
+            blk = mba.get_mblock(blk_idx)
+            if blk.start <= target_ea < blk.end:
+                target_block = blk
+                # Find the instruction at or after target_ea
+                insn = blk.head
+                while insn is not None:
+                    if insn.ea >= target_ea:
+                        target_insn = insn
+                        break
+                    insn = insn.next
+                break
+
+        if target_block is None:
+            return AssertionResult(func=func, addr=addr, reg=reg, value=value,
+                                   inserted=False,
+                                   error=f"Address {addr} not found in function microcode")
+
+        # Build assertion: mov #value, reg
+        # minsn_t with opcode m_mov, left=const operand, dest=reg operand
+        new_insn = ida_hexrays.minsn_t(target_ea)
+        new_insn.opcode = ida_hexrays.m_mov
+
+        # Set left operand to constant value
+        new_insn.l.make_number(value, 8, target_ea)
+
+        # Set destination operand to register
+        # Try to resolve register number from name
+        reg_num = idaapi.str2reg(reg)
+        if reg_num < 0:
+            return AssertionResult(func=func, addr=addr, reg=reg, value=value,
+                                   inserted=False,
+                                   error=f"Unknown register: {reg!r}")
+        new_insn.d.make_reg(reg_num, 8)
+
+        # Insert before target_insn (or at block end if not found)
+        if target_insn is not None:
+            target_block.insert_into_block(new_insn, target_insn.prev)
+        else:
+            target_block.insert_into_block(new_insn, target_block.tail)
+
+        mba.verify(True)
+
+        return AssertionResult(func=func, addr=addr, reg=reg, value=value, inserted=True)
+
+    except IDAError:
+        raise
+    except Exception as e:
+        return AssertionResult(func=func, addr=addr, reg=reg, value=value,
+                               inserted=False, error=str(e))
+
+
+@tool
+@idasync
+def microcode_delete_insn(
+    func: Annotated[str, "Function address or name (e.g. 0x401000 or main)"],
+    addr: Annotated[str, "Address of the microinstruction to delete"],
+) -> DeleteInsnResult:
+    """Delete a microinstruction from its containing block (IDA 9.3+).
+
+    Finds the first microinstruction at 'addr' within the function's microcode
+    and removes it using mblock_t.remove_from_block(). This is useful for
+    removing obfuscation instructions that confuse decompilation.
+
+    Requires IDA Pro 9.3+ (mblock_t.remove_from_block API).
+    """
+    _require_ida_93()
+
+    try:
+        fn_ea = parse_address(func)
+        fn = idaapi.get_func(fn_ea)
+        if fn is None:
+            return DeleteInsnResult(func=func, addr=addr, deleted=False,
+                                    error="Function not found")
+
+        target_ea = parse_address(addr)
+        mat = _MATURITY_MAP["MMAT_GLBOPT1"]
+        mba = _get_mba(fn_ea, mat)
+
+        for blk_idx in range(mba.qty):
+            blk = mba.get_mblock(blk_idx)
+            insn = blk.head
+            while insn is not None:
+                if insn.ea == target_ea:
+                    text = _insn_text(insn)
+                    blk.remove_from_block(insn)
+                    mba.verify(True)
+                    return DeleteInsnResult(
+                        func=func, addr=addr, deleted=True, text=text
+                    )
+                insn = insn.next
+
+        return DeleteInsnResult(
+            func=func, addr=addr, deleted=False,
+            error=f"No microinstruction found at {addr}"
+        )
+
+    except IDAError:
+        raise
+    except Exception as e:
+        return DeleteInsnResult(func=func, addr=addr, deleted=False, error=str(e))
